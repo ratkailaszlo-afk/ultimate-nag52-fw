@@ -413,7 +413,7 @@ TccClutchStatus TorqueConverter::get_clutch_state(void) {
     // Reduction or equal state (EG: Closed -> Slipping)
     // Just return the target state
     if (this->current_tcc_state >= targ) {
-        switch (this->current_tcc_state) {
+        switch (targ) {
             case InternalTccState::Closed:
                 ret = TccClutchStatus::Closed;
                 break;
