@@ -173,6 +173,7 @@ ComfortProfile::ComfortProfile(bool is_diesel) : AbstractProfile(
         C_UPSHIFT_TIME_MAP,
         C_DOWNSHIFT_TIME_MAP
     ) {
+    this->coast_redline_rpm = is_diesel ? VEHICLE_CONFIG.red_line_rpm_diesel : VEHICLE_CONFIG.red_line_rpm_petrol;
 }
 
 GearboxDisplayGear ComfortProfile::get_display_gear(GearboxGear target, GearboxGear actual) {
@@ -200,6 +201,21 @@ GearboxDisplayGear ComfortProfile::get_display_gear(GearboxGear target, GearboxG
     }
 }
 
+void ComfortProfile::update_coast_context(GearboxGear actual, GearboxGear target, SensorData* sensors,
+        bool automatic_context, bool valid_signals, uint8_t fresh_pedal, uint32_t now_ms) {
+    if (sensors == nullptr) {
+        this->coast_guard.reset();
+        return;
+    }
+    const bool rpm_safe = this->coast_redline_rpm > 500 &&
+        sensors->input_rpm < this->coast_redline_rpm - 500 &&
+        sensors->engine_rpm < this->coast_redline_rpm - 500;
+    const bool eligible = automatic_context && valid_signals && rpm_safe &&
+        actual == GearboxGear::Third && target == GearboxGear::Third &&
+        sensors->input_rpm != UINT16_MAX && sensors->engine_rpm != UINT16_MAX;
+    this->coast_guard.observe(eligible, fresh_pedal, sensors->output_rpm, now_ms);
+}
+
 bool ComfortProfile::should_upshift(GearboxGear current_gear, SensorData* sensors) {
     if (current_gear == GearboxGear::Fifth) {
         return false;
@@ -207,6 +223,9 @@ bool ComfortProfile::should_upshift(GearboxGear current_gear, SensorData* sensor
     if (this->upshift_table != nullptr) { // TEST TABLE
         bool can_upshift = sensors->input_rpm > this->upshift_table->get_value(sensors->pedal_pos/2.5, (float)current_gear);
         if (sensors->brake_pressed) { can_upshift = false; }
+        if (current_gear == GearboxGear::Third && sensors->pedal_pos == 0 && this->coast_guard.blocks_upshift()) {
+            can_upshift = false;
+        }
         //if (can_upshift) {
         //    if (sensors->max_torque != 0) {
         //        float demanded_load = (MAX(sensors->driver_requested_torque, 0) * 100) / sensors->max_torque;

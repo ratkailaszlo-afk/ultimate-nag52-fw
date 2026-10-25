@@ -5,6 +5,7 @@
 
 #include "common_structs.h"
 #include "stored_map.h"
+#include "c34_coast_guard.h"
 
 const uint8_t NUM_PROFILES = 6u; // S, C, W, A, M, R
 const uint8_t PROFILE_IDX_S = 0u;
@@ -133,9 +134,15 @@ public:
     GearboxDisplayGear get_display_gear(GearboxGear target, GearboxGear actual) override;
     bool should_upshift(GearboxGear current_gear, SensorData* sensors) override;
     bool should_downshift(GearboxGear current_gear, SensorData* sensors) override;
+    // Controller-only loop hook; inactive contexts clear stale lift-off state.
+    void update_coast_context(GearboxGear actual, GearboxGear target, SensorData* sensors,
+        bool automatic_context, bool valid_signals, uint8_t fresh_pedal, uint32_t now_ms);
     GearboxGear get_start_gear(void) const override {
         return GearboxGear::Second;
     }
+private:
+    C34CoastGuard coast_guard;
+    uint16_t coast_redline_rpm = 0;
 };
 
 class WinterProfile : public AbstractProfile {

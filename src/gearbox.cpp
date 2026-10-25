@@ -897,7 +897,8 @@ void Gearbox::controller_loop()
         // Set sensors Motor temperature (Always ran)
         int16_t coolant_temp = egs_can_hal->get_engine_coolant_temp(50);
 
-        bool speeds_valid = this->process_speed_sensors();
+        bool coast_raw_speeds_valid = false;
+        bool speeds_valid = this->process_speed_sensors(&coast_raw_speeds_valid);
         if (speeds_valid)
         {
             this->cached_input_rpm = first_order_filter(3, speed_sensors.turbine * 100, this->cached_input_rpm);
@@ -997,6 +998,23 @@ void Gearbox::controller_loop()
         }
         this->cached_engine_rpm = first_order_filter(3, tmp_rpm * 100, this->cached_engine_rpm);
         this->sensor_data.engine_rpm = this->cached_engine_rpm / 100;
+        // Observe every loop, not only when the automatic profile decision runs.
+        // The existing 1000ms pedal/fallback behavior above is deliberately unchanged.
+        const uint8_t coast_pedal = egs_can_hal->get_pedal_value(100);
+        const uint16_t coast_engine_rpm = egs_can_hal->get_engine_rpm(100);
+        const bool coast_engine_valid = coast_engine_rpm != UINT16_MAX && coast_engine_rpm > 100 &&
+            this->redline_rpm > 500 && coast_engine_rpm < this->redline_rpm - 500;
+        portENTER_CRITICAL(&this->profile_mutex);
+        AbstractProfile* coast_profile = this->current_profile;
+        portEXIT_CRITICAL(&this->profile_mutex);
+        if (comfort != nullptr) {
+            comfort->update_coast_context(this->actual_gear, this->target_gear, &this->sensor_data,
+                coast_profile == comfort && !this->shifting && gear_disagree_count == 0 &&
+                    this->sensor_data.engine_rpm > 100,
+                speeds_valid && coast_raw_speeds_valid && coast_engine_valid && coast_pedal != UINT8_MAX,
+                coast_pedal, GET_CLOCK_TIME());
+        }
+
         // Update solenoids, only if engine RPM is OK
         if (tmp_rpm > 400)
         {
@@ -1390,7 +1408,7 @@ void Gearbox::controller_loop()
     }
 }
 
-bool Gearbox::process_speed_sensors()
+bool Gearbox::process_speed_sensors(bool* raw_signals_valid)
 {
     bool ok = true;
     bool conduct_sanity_check = gear_disagree_count == 0 &&
@@ -1402,6 +1420,10 @@ bool Gearbox::process_speed_sensors()
     uint16_t n2 = TCUIO::n2_rpm();
     uint16_t n3 = TCUIO::n3_rpm();
     uint16_t output = TCUIO::output_rpm();
+    if (raw_signals_valid != nullptr) {
+        // Export validity from the same sample; keep the legacy fallback/return unchanged.
+        *raw_signals_valid = n2 != UINT16_MAX && n3 != UINT16_MAX && output != UINT16_MAX;
+    }
 
     if (UINT16_MAX != n2 && UINT16_MAX != n3) {
         uint16_t turbine = TCUIO::calc_turbine_rpm(n2, n3);

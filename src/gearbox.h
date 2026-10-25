@@ -76,7 +76,7 @@ private:
     GearboxGear target_gear = GearboxGear::Park;
     GearboxGear actual_gear = GearboxGear::Park;
     GearboxGear last_fwd_gear = GearboxGear::Second;
-    bool process_speed_sensors();
+    bool process_speed_sensors(bool* raw_signals_valid = nullptr);
     [[noreturn]]
     void controller_loop(void);
 

@@ -40,6 +40,18 @@ uint8_t CrossoverShift::step_internal(
     bool stationary,
     bool is_upshift
 ) {
+    // Keep eligibility fixed through pedal or active-profile changes mid-shift.
+    if (!this->comfort_timing_latched) {
+        this->comfort_timing_latched = true;
+        this->comfort_timing_eligible =
+            sid->profile != nullptr &&
+            sid->profile->get_profile() == GearboxProfile::Comfort &&
+            is_upshift &&
+            (sid->change == GearChange::_1_2 || sid->change == GearChange::_2_3) &&
+            sd->converted_torque > 0 &&
+            sd->pedal_pos >= 50 && sd->pedal_pos <= 150;
+    }
+
     uint8_t ret = STEP_RES_CONTINUE;
     if (phase_id == PHASE_BLEED) {
         ret = this->phase_bleed(pm);
@@ -277,6 +289,10 @@ uint8_t CrossoverShift::phase_overlap() {
 
         uint8_t rpm_adder = interpolate_float(sd->input_rpm, &CRS_CURRENT_SETTINGS.overlap_cycles_adder_rpm, InterpType::Linear);
         this->timer_shift += rpm_adder;
+        if (this->comfort_timing_eligible) {
+            // Round to nearest cycle; truncating 90% can remove an extra cycle.
+            this->timer_shift = MAX(1, (this->timer_shift * 9 + 5) / 10);
+        }
         this->subphase_shift += 1;
         if (sid->profile == race) {
             this->trq_req_timer = MAX(3, this->timer_shift);
@@ -463,7 +479,7 @@ uint8_t CrossoverShift::phase_overlap2() {
     }
 
     if (!this->trq_req_up_ramp && sid->ptr_r_clutch_speeds->on_clutch_speed < this->threshold_rpm && subphase_shift >= 2) {
-        this->trq_req_timer = 3;
+        this->trq_req_timer = this->comfort_timing_eligible ? 4 : 3;
         this->trq_req_up_ramp = true;
     }
 

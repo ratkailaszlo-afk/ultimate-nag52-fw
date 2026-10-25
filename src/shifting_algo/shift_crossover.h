@@ -17,6 +17,10 @@ public:
 protected:
     bool is_release_shift() override {return false; }
 private:
+    // Snapshot eligibility once at the first actual shift step.
+    bool comfort_timing_latched = false;
+    bool comfort_timing_eligible = false;
+
     uint16_t ramp_filling_trq_limit = 0;
     uint8_t phase_fill();
     uint8_t phase_overlap();
