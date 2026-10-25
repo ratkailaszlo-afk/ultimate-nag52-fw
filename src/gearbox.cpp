@@ -1177,7 +1177,11 @@ void Gearbox::controller_loop()
                 {
                     if (this->tcc != nullptr)
                     {
-                        this->tcc->update(this->actual_gear, this->target_gear, this->pressure_mgr, this->current_profile, &this->sensor_data);
+                        // Profiles live for the lifetime of the TCU; only snapshot the pointer under lock.
+                        portENTER_CRITICAL(&this->profile_mutex);
+                        AbstractProfile* tcc_profile = this->current_profile;
+                        portEXIT_CRITICAL(&this->profile_mutex);
+                        this->tcc->update(this->actual_gear, this->target_gear, this->pressure_mgr, tcc_profile, &this->sensor_data);
                         egs_can_hal->set_clutch_status(this->tcc->get_clutch_state());
                     }
                 }
