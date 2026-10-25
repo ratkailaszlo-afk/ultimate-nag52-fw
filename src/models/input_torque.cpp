@@ -17,6 +17,11 @@ int16_t InputTorqueModel::get_input_torque(uint16_t engine_rpm, uint16_t input_r
 }
 
 float InputTorqueModel::get_input_torque_factor(uint16_t engine, uint16_t input) {
+    // No speed ratio is defined with a stopped engine. Keep the neutral
+    // multiplier used by the caller while preserving its invalid CAN status.
+    if (engine == 0) {
+        return 1.0f;
+    }
     float rpm_multi = ((float)input) / ((float)engine);
 
     //Interpolate map, but faster, since its just 4 values, no need to allocate a whole map for this
