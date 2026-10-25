@@ -37,6 +37,7 @@
 #define RLI_EMBED_FILE_INFO     0x2C // location and len of EMBED.ZIP
 #define RLI_TCC_CYCLE_TRACE     0x2D // read-only TCC cycle trace
 #define RLI_RUNTIME_MONITOR     0x2E // read-only runtime monitor v1
+#define RLI_GLIDING_STATUS      0x2F // read-only GLD1, 40 bytes
 
 #define RLI_CLUTCH_SPEEDS   0x30
 #define RLI_SHIFTING_ALGO   0x31

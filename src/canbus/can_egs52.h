@@ -61,6 +61,7 @@ class Egs52Can: public EgsBaseCan {
         bool engine_ack_torque_request(const uint32_t expire_time_ms) override;
         bool esp_torque_intervention_active(const uint32_t expire_time_ms) override;
         bool is_cruise_control_active(const uint32_t expire_time_ms) override;
+        GlidingCanInputs get_gliding_inputs(uint32_t expire_time_ms) override;
         int cruise_control_torque_demand(const uint32_t expire_time_ms) override;
         int esp_torque_demand(const uint32_t expire_time_ms) override;
         TccReqState get_engine_tcc_override_request(const uint32_t expire_time_ms) override;
@@ -108,6 +109,8 @@ class Egs52Can: public EgsBaseCan {
         void tx_frames() override;
         void on_rx_frame(uint32_t id,  uint8_t dlc, uint64_t data, const uint32_t timestamp) override;
     private:
+        portMUX_TYPE gliding_can_mux = portMUX_INITIALIZER_UNLOCKED;
+        uint8_t gliding_invalid_mask = 0x1F; // Explicit unseen/malformed watched frames.
         GearboxProfile curr_profile_bit = GearboxProfile::Underscore;
         GearboxMessage curr_message = GearboxMessage::None;
         // CAN Frames to Tx

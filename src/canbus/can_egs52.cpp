@@ -410,13 +410,64 @@ bool Egs52Can::esp_torque_intervention_active(const uint32_t expire_time_ms) {
     return r;
 }
 
-bool Egs52Can::is_cruise_control_active(const uint32_t expire_time_ms) {
-    BS_300_EGS52 bs300;
-    int r = false;
-    if (this->esp_ecu.get_BS_300(GET_CLOCK_TIME(), expire_time_ms, &bs300)) {
-        r = bs300.DMMAX_ART || bs300.DMMIN_ART;
+GlidingCanInputs Egs52Can::get_gliding_inputs(uint32_t expire_time_ms) {
+    GlidingCanInputs out;
+    const uint32_t now = GET_CLOCK_TIME();
+    if (expire_time_ms == 0 || now < expire_time_ms) return out;
+    MS_210_EGS52 ms210{};
+    BS_300_EGS52 bs300{};
+    BS_208_EGS52 bs208{};
+    BS_200_EGS52 bs200{};
+    EWM_230_EGS52 ewm{};
+    portENTER_CRITICAL(&gliding_can_mux);
+    const uint8_t invalid = gliding_invalid_mask;
+    const bool driver_seen = !(invalid & 1) && ecu_ms.get_MS_210(now, expire_time_ms, &ms210);
+    const bool dynamics_seen = !(invalid & 2) && esp_ecu.get_BS_300(now, expire_time_ms, &bs300);
+    const bool wheels_seen = !(invalid & 4) && esp_ecu.get_BS_208(now, expire_time_ms, &bs208);
+    const bool brake_seen = !(invalid & 8) && esp_ecu.get_BS_200(now, expire_time_ms, &bs200);
+    const bool selector_seen = !(invalid & 16) && ewm_ecu.get_EWM_230(now, expire_time_ms, &ewm);
+    portEXIT_CRITICAL(&gliding_can_mux);
+    out.driver_valid = driver_seen && ms210.PW <= 250 && !ms210.PWG_ERR &&
+        !ms210.NOTL && !ms210.CRASH_MS;
+    if (out.driver_valid) out.pedal = ms210.PW;
+    out.speed_control_bits =
+        (driver_seen && ms210.TM_EIN ? 1 : 0) |
+        (driver_seen && ms210.TM_REG ? 2 : 0) |
+        (driver_seen && ms210.V_MAX_EIN ? 4 : 0) |
+        (driver_seen && ms210.V_MAX_REG ? 8 : 0) |
+        (dynamics_seen && bs300.ART_E ? 16 : 0) |
+        (dynamics_seen && bs300.DMMAX_ART ? 32 : 0) |
+        (dynamics_seen && bs300.DMMIN_ART ? 64 : 0) |
+        (wheels_seen && bs208.BRE_AKT_ART ? 128 : 0);
+    const bool engine_speed_control = driver_seen &&
+        (ms210.TM_EIN || ms210.TM_REG || ms210.V_MAX_EIN || ms210.V_MAX_REG);
+    const bool adaptive_control = dynamics_seen &&
+        (bs300.ART_E || bs300.DMMAX_ART || bs300.DMMIN_ART);
+    if (engine_speed_control || adaptive_control || (wheels_seen && bs208.BRE_AKT_ART))
+        out.cruise = CruiseControlState::Active;
+    else if (driver_seen && dynamics_seen && wheels_seen)
+        out.cruise = CruiseControlState::Inactive;
+    out.dynamics_valid = dynamics_seen && wheels_seen &&
+        bs208.SZS == BS_208h_SZS_EGS52::NORM;
+    out.dynamics_active = !out.dynamics_valid || bs300.MMIN_ESP || bs300.MMAX_ESP ||
+        bs300.BAS_AKT || bs300.VOLLBRE || bs300.ESP_GIER_AKT || bs300.AMR_AKT_ESP ||
+        bs208.BRE_AKT_ESP || bs208.BRE_AKT_ART;
+    out.brake_released = brake_seen && bs200.BLS == BS_200h_BLS_EGS52::BREMSE_NBET;
+    out.selector_d = selector_seen && VEHICLE_CONFIG.shifter_style == uint8_t(ShifterStyle::EWM) &&
+        ewm.WHC == EWM_230h_WHC_EGS52::D;
+    out.wheels_valid = wheels_seen && bs208.DHL != 0x3FFF && bs208.DHR != 0x3FFF &&
+        bs208.DRTGHL == BS_208h_DRTGHL_EGS52::FWD &&
+        bs208.DRTGHR == BS_208h_DRTGHR_EGS52::FWD;
+    if (out.wheels_valid) {
+        out.left_wheel_2x_rpm = bs208.DHL;
+        out.right_wheel_2x_rpm = bs208.DHR;
     }
-    return r;
+    return out;
+}
+
+bool Egs52Can::is_cruise_control_active(const uint32_t expire_time_ms) {
+    // Unknown is treated as active by this conservative compatibility helper.
+    return get_gliding_inputs(expire_time_ms).cruise != CruiseControlState::Inactive;
 }
 
 int Egs52Can::cruise_control_torque_demand(const uint32_t expire_time_ms) {
@@ -734,6 +785,9 @@ void Egs52Can::set_display_gear(GearboxDisplayGear g, bool manual_mode) {
         case GearboxDisplayGear::Failure:
             this->gs418.FSC = 'F';
             break;
+        case GearboxDisplayGear::Gliding:
+            this->gs418.FSC = 'G';
+            break;
         case GearboxDisplayGear::SNA:
         default:
             this->gs418.FSC = ' ';
@@ -897,6 +951,19 @@ void Egs52Can::tx_frames() {
 }
 
 void Egs52Can::on_rx_frame(uint32_t id,  uint8_t dlc, uint64_t data, const uint32_t timestamp) {
+    uint8_t watched = 0;
+    if (id == MS_210_EGS52_CAN_ID) watched = 1;
+    else if (id == BS_300_EGS52_CAN_ID) watched = 2;
+    else if (id == BS_208_EGS52_CAN_ID) watched = 4;
+    else if (id == BS_200_EGS52_CAN_ID) watched = 8;
+    else if (id == EWM_230_EGS52_CAN_ID) watched = 16;
+    portENTER_CRITICAL(&gliding_can_mux);
+    if (watched && dlc != 8) {
+        gliding_invalid_mask |= watched;
+        portEXIT_CRITICAL(&gliding_can_mux);
+        return;
+    }
+    gliding_invalid_mask &= uint8_t(~watched);
     if(this->ecu_ms.import_frames(data, id, timestamp)) {
         //if (this->fake_rpm != 0 && id == MS_308_CAN_ID) {
         //    uint64_t d = (data & 0xff0000ffffffffff) | ((uint64_t)this->fake_rpm & 0xffff) << 40;
@@ -911,4 +978,5 @@ void Egs52Can::on_rx_frame(uint32_t id,  uint8_t dlc, uint64_t data, const uint3
     } else if (this->misc_ecu.import_frames(data, id, timestamp)) {
     } else if (this->ezs_ecu.import_frames(data, id, timestamp)) {
     }
+    portEXIT_CRITICAL(&gliding_can_mux);
 }

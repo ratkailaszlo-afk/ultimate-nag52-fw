@@ -89,6 +89,7 @@ int16_t get_cell_value(int16_t* dest, GearboxGear gear, uint8_t load_idx) {
 
 
 void TorqueConverter::suspend(PressureManager* pm) {
+    this->glide.suspend();
     // The gearbox may force the electrical target off without calling update().
     // Drop the matching internal model so re-entry gets a fresh prefill decision.
     this->tcc_commanded_pressure = 0;
@@ -105,6 +106,7 @@ void TorqueConverter::suspend(PressureManager* pm) {
     this->trace_command_before_atf = 0;
     this->can_request_bits.store(0, std::memory_order_relaxed);
     this->engine_load_percent = 0;
+    this->last_control_torque = 0;
     this->engine_output_joule = 0;
     this->absorbed_power_joule = 0;
     if (pm != nullptr) {
@@ -113,7 +115,7 @@ void TorqueConverter::suspend(PressureManager* pm) {
     // is_shifting / upshifting / release_shifting belong to the shift thread.
 }
 
-void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, PressureManager* pm, AbstractProfile* profile, SensorData* sensors, bool s_city_third_coast) {
+void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, PressureManager* pm, AbstractProfile* profile, SensorData* sensors, bool s_city_third_coast, const Gliding::Context* gliding) {
     this->trace_prefill_taken = false;
     // Selected CAN request before reaction flags; snapshot also updates on disable paths.
     const TccReqState engine_req_state = (egs_can_hal != nullptr)
@@ -124,7 +126,16 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
         std::memory_order_relaxed);
 
     int slip_now = abs((int32_t)sensors->engine_rpm-(int32_t)sensors->input_rpm);
-    int motor_torque = sensors->converted_torque;
+    Gliding::Context local_gliding;
+    if (gliding != nullptr) {
+        local_gliding = *gliding;
+        local_gliding.shifting = local_gliding.shifting || this->is_shifting;
+    }
+    this->glide.observe(gliding != nullptr ? &local_gliding : nullptr, GET_CLOCK_TIME());
+    const bool glide_managed = this->glide.managed();
+    int motor_torque = glide_managed && gliding != nullptr && gliding->feedback_valid
+        ? gliding->torque_nm : sensors->converted_torque;
+    this->last_control_torque = motor_torque;
     int load_as_percent = abs(((int)motor_torque*100) / this->rated_max_torque);
     this->engine_load_percent = load_as_percent;
 
@@ -258,6 +269,10 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
         targ = InternalTccState::Open;
         slipping_rpm_targ = SLIP_V_WHEN_OPEN;
     }
+    if (this->glide.requests_open()) {
+        targ = InternalTccState::Open;
+        slipping_rpm_targ = SLIP_V_WHEN_OPEN;
+    }
     // Variable set
     this->target_tcc_state = targ;
     this->slip_target = MIN(slipping_rpm_targ, SLIP_V_WHEN_OPEN);
@@ -271,7 +286,7 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
     }
 
     bool is_adaptable = abs(this->tcc_commanded_pressure-this->tcc_actual_pressure/100) < 2;
-    if (!TCC_CURRENT_SETTINGS.adapt_enable) {
+    if (glide_managed || !TCC_CURRENT_SETTINGS.adapt_enable) {
         is_adaptable = false;
     }
     if (sensors->atf_temp < TCC_CURRENT_SETTINGS.tcc_temp_multiplier.raw_max) {
@@ -315,6 +330,12 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
     // The low model-pressure check admits prefill and also ends an existing
     // burst early. Complete it explicitly instead of leaving a live counter
     // behind; do not extend the existing 10000 mbar pulse to its full cap.
+    if (glide_managed) {
+        // Managed reapplication fills through the actual command slew limiter.
+        this->prefill_running = false;
+        this->prefill_done = true;
+        this->prefill_cycles = 0;
+    }
     const bool prefill_pressure_low = this->tcc_actual_pressure/100 < 100;
     const bool increasing_state = this->target_tcc_state > this->current_tcc_state;
     if (prefill_running && !prefill_done && (!prefill_pressure_low || !increasing_state)) {
@@ -323,7 +344,7 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
         prefill_cycles = 0;
     }
     // Prefilling when suddenly increasing state requested
-    if (increasing_state && prefill_pressure_low && !prefill_done) {
+    if (!glide_managed && increasing_state && prefill_pressure_low && !prefill_done) {
         // Prefill logic
         this->trace_prefill_taken = true;
         if (false == prefill_running) {
@@ -401,6 +422,7 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
         float mul = interpolate_float(sensors->atf_temp, &TCC_CURRENT_SETTINGS.tcc_temp_multiplier, InterpType::Linear);
         this->tcc_commanded_pressure = (float)this->tcc_commanded_pressure*mul;
     }
+    this->tcc_commanded_pressure = this->glide.limit(this->tcc_commanded_pressure, GET_CLOCK_TIME());
     // Pressure achieved in the internal filtered model (not measured pressure).
     if (abs(this->tcc_commanded_pressure-this->tcc_actual_pressure/100) < 1) {
         this->current_tcc_state = this->target_tcc_state;
@@ -510,6 +532,8 @@ void TorqueConverter::trace_before(TccTraceRecord& r) const {
     if (was_shifting) r.flags |= TccTrace::WAS_SHIFTING;
 }
 void TorqueConverter::trace_after(TccTraceRecord& r) const {
+    // The managed exit uses the current loop torque snapshot, not its old cache.
+    r.converted_torque_at_tcc = this->last_control_torque;
     r.state_after = uint8_t(current_tcc_state);
     r.target_after = uint8_t(target_tcc_state);
     r.prefill_flags_after = (prefill_running ? 1 : 0) | (prefill_done ? 2 : 0);

@@ -125,6 +125,7 @@ enum class GearboxDisplayGear: uint8_t {
     Four,
     Five,
     Failure,
+    Gliding,
     SNA = 0xFF,
 };
 

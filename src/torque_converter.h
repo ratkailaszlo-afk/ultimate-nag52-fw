@@ -14,6 +14,7 @@
 #include "nvs/module_settings.h"
 #include "tcc_trace.h"
 #include "adapt_maps.h"
+#include "gliding_mode.h"
 
 enum class InternalTccState {
     Open = 0,
@@ -37,7 +38,7 @@ class TorqueConverter {
          */
         // Optional same-pass gearbox gate; callers without fresh context retain
         // the previous policy. No diagnostic or persisted configuration ABI change.
-        void update(GearboxGear curr_gear, GearboxGear targ_gear, PressureManager* pm, AbstractProfile* profile, SensorData* sensors, bool s_city_third_coast = false);
+        void update(GearboxGear curr_gear, GearboxGear targ_gear, PressureManager* pm, AbstractProfile* profile, SensorData* sensors, bool s_city_third_coast = false, const Gliding::Context* gliding = nullptr);
         // Force the converter control open when the gearbox cannot run update().
         // Shift-thread flags remain owned by the shifting algorithm.
         void suspend(PressureManager* pm);
@@ -66,6 +67,8 @@ class TorqueConverter {
         void trace_before(TccTraceRecord& r) const;
         void trace_after(TccTraceRecord& r) const;
 
+        bool gliding_display_active() const { return glide.show_g(); }
+        Gliding::Status gliding_status(uint32_t now) const { return glide.status(now); }
         void set_stationary();
         
         void shift_start(bool upshift, bool release_shifting);
@@ -106,6 +109,7 @@ class TorqueConverter {
         }
 
     private:
+        Gliding::Controller glide;
         // bit0 Open, bit1 Slipping: selected CAN request before reaction flags.
         std::atomic<uint8_t> can_request_bits{0};
         // Multiplied by 100!
@@ -125,6 +129,7 @@ class TorqueConverter {
         StoredMap* slip_rpm_target_map;
         bool pending_changes = false;
         int16_t engine_load_percent = 0;
+        int16_t last_control_torque = 0;
         
         bool init_tables_ok = false;
 

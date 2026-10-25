@@ -1,4 +1,5 @@
 #include "kwp2000.h"
+#include "../gliding_status.h"
 #include <esp_ota_ops.h>
 #include <string>
 #include <time.h>
@@ -544,6 +545,14 @@ void Kwp2000_server::process_read_data_local_ident(uint8_t* args, uint16_t arg_l
             return;
         }
         make_diag_pos_msg(SID_READ_DATA_LOCAL_IDENT, RLI_TCC_CYCLE_TRACE, page, used);
+    } else if (args[0] == RLI_GLIDING_STATUS) {
+        uint8_t data[GlidingStatus::WIRE_SIZE] = {};
+        size_t used = 0;
+        if (!GlidingStatus::read(data, sizeof(data), &used)) {
+            make_diag_neg_msg(SID_READ_DATA_LOCAL_IDENT, NRC_REQUEST_OUT_OF_RANGE);
+            return;
+        }
+        make_diag_pos_msg(SID_READ_DATA_LOCAL_IDENT, RLI_GLIDING_STATUS, data, used);
     } else if (args[0] == RLI_RUNTIME_MONITOR) {
         uint8_t data[RuntimeMonitor::kWireSize] = {};
         size_t used = 0;

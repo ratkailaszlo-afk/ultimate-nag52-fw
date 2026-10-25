@@ -3,6 +3,7 @@
 #include "s_city_tcc_coast.h"
 #include "runtime_monitor.h"
 #include "runtime_signal_policy.h"
+#include "gliding_status.h"
 #include "esp_timer.h"
 #include "common_structs_ops.h"
 #include "nvs/eeprom_config.h"
@@ -869,7 +870,10 @@ void Gearbox::controller_loop()
             RuntimeMonitor::source_complete(RuntimeMonitor::Source::IoCompletion, RuntimeMonitor::now_us());
         }
         if (CHECK_MODE_BIT_ENABLED(DEVICE_MODE_SLAVE)) {
-            if (this->tcc) this->tcc->suspend(this->pressure_mgr);
+            if (this->tcc) {
+                this->tcc->suspend(this->pressure_mgr);
+                GlidingStatus::publish(this->tcc->gliding_status(GET_CLOCK_TIME()));
+            }
             previous_speeds_valid = previous_engine_valid = previous_pedal_valid = false;
             SOLENOID_CONTROL_EGS_SLAVE slave_rq = egs_can_hal->get_tester_req();
             sol_mpc->set_current_target(__builtin_bswap16(slave_rq.MPC_REQ));
@@ -928,7 +932,10 @@ void Gearbox::controller_loop()
         }
         if (this->diag_stop_control)
         {
-            if (this->tcc) this->tcc->suspend(this->pressure_mgr);
+            if (this->tcc) {
+                this->tcc->suspend(this->pressure_mgr);
+                GlidingStatus::publish(this->tcc->gliding_status(GET_CLOCK_TIME()));
+            }
             previous_speeds_valid = previous_engine_valid = previous_pedal_valid = false;
             cycle_trace.path = 0; // Diagnostic stop skips the controller update.
             TccTrace::append(cycle_trace);
@@ -1019,7 +1026,8 @@ void Gearbox::controller_loop()
                 // ESP_LOG_LEVEL(ESP_LOG_ERROR, "GEARBOX", "GEAR RATIO IMPLAUSIBLE");
             }
         }
-        const uint8_t p_tmp = egs_can_hal->get_pedal_value(100);
+        const GlidingCanInputs gliding_can = egs_can_hal->get_gliding_inputs(Gliding::CAN_EXPIRY_MS);
+        const uint8_t p_tmp = gliding_can.driver_valid ? gliding_can.pedal : egs_can_hal->get_pedal_value(100);
         const bool pedal_valid = p_tmp != UINT8_MAX;
         this->pedal_last = this->sensor_data.pedal_pos;
         if (pedal_valid)
@@ -1272,6 +1280,9 @@ void Gearbox::controller_loop()
         // A skipped update is a real suspension, not just a zero PM target.
         // This covers P/N/R (including a non-forward target), signal faults and
         // observed engine stop before the later PM output can reapply old state.
+        // Exactly one torque decoder call per loop: its EGS52 implementation
+        // maintains demand-correction state. Share the same fresh sample.
+        const CanTorqueData loop_torque = egs_can_hal->get_torque_data(100);
         if (forward_control_valid && is_fwd_gear(this->actual_gear) && is_fwd_gear(this->target_gear)) {
             if (this->tcc != nullptr)
             {
@@ -1329,8 +1340,35 @@ void Gearbox::controller_loop()
                         .raw_pedal = coast_pedal,
                         .cached_pedal = this->sensor_data.pedal_pos,
                     };
+                    const CanTorqueData& glide_torque = loop_torque;
+                    const bool automatic_glide_profile = tcc_profile != nullptr &&
+                        (tcc_profile->get_profile() == GearboxProfile::Standard ||
+                         tcc_profile->get_profile() == GearboxProfile::Comfort ||
+                         tcc_profile->get_profile() == GearboxProfile::Agility ||
+                         tcc_profile->get_profile() == GearboxProfile::Winter);
+                    Gliding::Context glide_context;
+                    glide_context.can = gliding_can;
+                    // Keep the physical brake input as an additional veto.
+                    glide_context.can.brake_released &= !sensor_data.brake_pressed;
+                    glide_context.feedback_valid = forward_control_valid && coast_raw_speeds_valid &&
+                        coast_engine_valid && glide_torque.m_converted_static != INT16_MAX;
+                    glide_context.atf_valid = atf_valid;
+                    glide_context.automatic_profile = automatic_glide_profile;
+                    glide_context.shifting = this->shifting;
+                    glide_context.actual_gear = uint8_t(this->actual_gear);
+                    glide_context.target_gear = uint8_t(this->target_gear);
+                    const float fifth_ratio = sensor_data.output_rpm > 250 ?
+                        float(sensor_data.input_rpm)/sensor_data.output_rpm : 0;
+                    glide_context.ratio_valid = gear_disagree_count == 0 &&
+                        fifth_ratio >= gearboxConfig.bounds[4].ratio_min_drift &&
+                        fifth_ratio <= gearboxConfig.bounds[4].ratio_max_drift;
+                    glide_context.speed_x100 = Gliding::speed_x100(gliding_can, VEHICLE_CONFIG.wheel_circumference);
+                    glide_context.engine_rpm = coast_engine_rpm;
+                    glide_context.input_rpm = sensor_data.input_rpm;
+                    glide_context.torque_nm = glide_torque.m_converted_static;
+                    glide_context.atf_c = sensor_data.atf_temp;
                     this->tcc->update(this->actual_gear, this->target_gear, this->pressure_mgr,
-                        tcc_profile, &this->sensor_data, SCityTccCoast::allow(third_coast_context));
+                        tcc_profile, &this->sensor_data, SCityTccCoast::allow(third_coast_context), &glide_context);
                 }
                 this->tcc->trace_after(cycle_trace);
                 egs_can_hal->set_clutch_status(this->tcc->get_clutch_state());
@@ -1368,7 +1406,7 @@ void Gearbox::controller_loop()
         egs_can_hal->set_actual_gear(this->actual_gear);
         egs_can_hal->set_wheel_torque(0); // Nm
 
-        CanTorqueData trqs = egs_can_hal->get_torque_data(100);
+        const CanTorqueData& trqs = loop_torque;
         // CALC TORQUES
         if (INT16_MAX != trqs.m_min) { sensor_data.min_torque = trqs.m_min; }
         if (INT16_MAX != trqs.m_max) { sensor_data.max_torque = trqs.m_max; }
@@ -1485,6 +1523,11 @@ void Gearbox::controller_loop()
                 egs_can_hal->set_display_msg(GearboxMessage::None);
                 egs_can_hal->set_display_gear(GearboxDisplayGear::Failure, false);
             }
+            else if (this->tcc != nullptr && this->tcc->gliding_display_active())
+            {
+                egs_can_hal->set_display_msg(GearboxMessage::None);
+                egs_can_hal->set_display_gear(GearboxDisplayGear::Gliding, false);
+            }
             else
             {
                 if (this->current_profile == race && this->fwd_gear_shift && SBS.debug_show_up_down_arrows_in_r) {
@@ -1520,6 +1563,8 @@ void Gearbox::controller_loop()
             this->tcc->trace_after(cycle_trace);
             cycle_trace.selected_can_request_bits = this->tcc->get_can_req_bits();
         }
+        if (this->tcc != nullptr)
+            GlidingStatus::publish(this->tcc->gliding_status(GET_CLOCK_TIME()));
         TccTrace::append(cycle_trace);
         monitor_loop.finish();
         uint32_t time = GET_CLOCK_TIME() - start;

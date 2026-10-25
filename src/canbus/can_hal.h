@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/portmacro.h>
 #include <esp_log.h>
 #include <freertos/queue.h>
 #include <string.h>
@@ -18,6 +19,7 @@
 #include "../../slave_ecus/src/EGS_SLAVE.h"
 #include "../../slave_ecus/src/TESTER.h"
 #include "can_defines.h"
+#include "gliding_inputs.h"
 
 #include "../shifter/shifter.h"
 #include "../shifter/programselector/programselector.h"
@@ -265,6 +267,11 @@ class EgsBaseCan {
         // Checks if ESP torque intervention is active (AKA Stability assist)
         virtual bool esp_torque_intervention_active(const uint32_t expire_time_ms) {
             return false;
+        }
+
+        // Default Unknown disables gliding on unsupported CAN variants.
+        virtual GlidingCanInputs get_gliding_inputs(uint32_t expire_time_ms) {
+            return GlidingCanInputs{};
         }
 
         // Checks if cruise control is active
