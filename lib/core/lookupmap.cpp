@@ -3,6 +3,7 @@
 #include "tcu_alloc.h"
 #include "clock.h"
 #include <string.h>
+#include <new>
 
 float LookupMap::get_value(const float xValue, const float yValue) {
     return this->get_value(xValue, yValue, 0);
@@ -123,46 +124,80 @@ LookupRefMap::LookupRefMap(int16_t* _xHeader, const uint16_t _xHeaderSize, int16
     this->yHeaderSize = _yHeaderSize;
 }
 
-LookupByteMap::LookupByteMap(uint8_t* _xHeader, const uint16_t _xHeaderSize, uint8_t* _yHeader, const uint16_t _yHeaderSize, uint8_t* _data, const uint16_t _dataSize) {
+LookupByteMap::LookupByteMap(uint8_t* _xHeader, const uint16_t _xHeaderSize, uint8_t* _yHeader, const uint16_t _yHeaderSize, uint8_t* _data, const uint16_t _dataSize)
+: x_alloc(nullptr), y_alloc(nullptr), z_alloc(nullptr), z_size(0) {
+    this->table = nullptr;
+    this->yHeader = nullptr;
+    this->yHeaderSize = 0;
+
+    if (_xHeader == nullptr || _yHeader == nullptr || _data == nullptr ||
+        _xHeaderSize == 0 || _yHeaderSize == 0 ||
+        static_cast<uint32_t>(_xHeaderSize) * _yHeaderSize != _dataSize) {
+        return;
+    }
+
     this->x_alloc = static_cast<int16_t*>(TCU_HEAP_ALLOC(_xHeaderSize * sizeof(int16_t)));
     this->y_alloc = static_cast<int16_t*>(TCU_HEAP_ALLOC(_yHeaderSize * sizeof(int16_t)));
     this->z_alloc = static_cast<int16_t*>(TCU_HEAP_ALLOC(_dataSize * sizeof(int16_t)));
+    if (this->x_alloc == nullptr || this->y_alloc == nullptr || this->z_alloc == nullptr) {
+        this->release();
+        return;
+    }
 
-    for (auto i = 0; i < _xHeaderSize; i++) {
+    for (uint16_t i = 0; i < _xHeaderSize; i++) {
         this->x_alloc[i] = _xHeader[i];
     }
-    for (auto i = 0; i < _yHeaderSize; i++) {
+    for (uint16_t i = 0; i < _yHeaderSize; i++) {
         this->y_alloc[i] = _yHeader[i];
     }
-    for (auto i = 0; i < _dataSize; i++) {
+    for (uint16_t i = 0; i < _dataSize; i++) {
         this->z_alloc[i] = _data[i];
     }
-    if (nullptr != this->x_alloc && nullptr != this->y_alloc && nullptr != this->z_alloc) {
-        this->table = new LookupRefTable(x_alloc, _xHeaderSize, z_alloc, _dataSize);
-        this->yHeader = new LookupRefHeader(y_alloc, _yHeaderSize);
-        this->yHeaderSize = _yHeaderSize;
+
+    this->table = new (std::nothrow) LookupRefTable(x_alloc, _xHeaderSize, z_alloc, _dataSize, true);
+    if (this->table == nullptr || !static_cast<LookupRefTable*>(this->table)->is_allocated()) {
+        this->release();
+        return;
     }
+    this->yHeader = new (std::nothrow) LookupRefHeader(y_alloc, _yHeaderSize);
+    if (this->yHeader == nullptr) {
+        this->release();
+        return;
+    }
+    this->yHeaderSize = _yHeaderSize;
+    this->z_size = _dataSize;
 }
 
 bool LookupByteMap::is_allocated(void) const {
-    return nullptr != this->x_alloc && nullptr != this->y_alloc && nullptr != this->z_alloc;
+    return this->table != nullptr && this->yHeader != nullptr &&
+           this->x_alloc != nullptr && this->y_alloc != nullptr && this->z_alloc != nullptr;
 }
 
 bool LookupByteMap::add_data(const uint8_t* map, const uint16_t size) {
-    if (size != this->z_size) {
+    if (!this->is_allocated() || map == nullptr || size != this->z_size) {
         return false;
-    } else {
-        for (auto i = 0; i < size; i++) {
-            this->z_alloc[i] = map[i];
-        }
-        return true;
     }
+    for (uint16_t i = 0; i < size; i++) {
+        this->z_alloc[i] = map[i];
+    }
+    return true;
 }
 
-LookupByteMap::~LookupByteMap() {
-    delete static_cast<LookupAllocTable*>(this->table);
-    delete static_cast<LookupAllocHeader*>(this->yHeader);
+void LookupByteMap::release() {
+    delete static_cast<LookupRefTable*>(this->table);
+    delete static_cast<LookupRefHeader*>(this->yHeader);
     TCU_FREE(this->x_alloc);
     TCU_FREE(this->y_alloc);
     TCU_FREE(this->z_alloc);
+    this->table = nullptr;
+    this->yHeader = nullptr;
+    this->x_alloc = nullptr;
+    this->y_alloc = nullptr;
+    this->z_alloc = nullptr;
+    this->yHeaderSize = 0;
+    this->z_size = 0;
+}
+
+LookupByteMap::~LookupByteMap() {
+    this->release();
 }

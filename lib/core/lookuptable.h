@@ -37,7 +37,10 @@ class LookupAllocTable: public LookupTable {
 
 class LookupRefTable: public LookupTable {
     public:
-        LookupRefTable(int16_t* _xHeader, uint16_t _xHeaderSize, int16_t* _data, uint16_t _dataSize);
+        LookupRefTable(int16_t* _xHeader, uint16_t _xHeaderSize, int16_t* _data, uint16_t _dataSize,
+                       bool nothrow_header = false);
+        ~LookupRefTable();
+        bool is_allocated(void) const;
 };
 
 #endif /* LOOKUPTABLE_H */

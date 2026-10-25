@@ -1,6 +1,7 @@
 #include "lookuptable.h"
 #include "tcu_alloc.h"
 #include <string.h>
+#include <new>
 #include "tcu_maths_impl.h"
 
 // Lookup table base implementations
@@ -117,10 +118,21 @@ bool LookupAllocTable::is_allocated(void) const
     return allocation_successful;
 }
 
-LookupRefTable::LookupRefTable(int16_t* _xHeader, uint16_t _xHeaderSize, int16_t* _data, uint16_t _dataSize)
+LookupRefTable::LookupRefTable(int16_t* _xHeader, uint16_t _xHeaderSize, int16_t* _data, uint16_t _dataSize, bool nothrow_header)
 :LookupTable() {
-    this->xHeader = new LookupRefHeader(_xHeader, _xHeaderSize);
+    this->xHeaderSize = _xHeaderSize;
+    this->xHeader = nothrow_header
+        ? new (std::nothrow) LookupRefHeader(_xHeader, _xHeaderSize)
+        : new LookupRefHeader(_xHeader, _xHeaderSize);
     this->data = _data;
     this->dataSize = _dataSize;
 }
 
+
+LookupRefTable::~LookupRefTable() {
+    delete static_cast<LookupRefHeader*>(this->xHeader);
+}
+
+bool LookupRefTable::is_allocated(void) const {
+    return this->xHeader != nullptr;
+}

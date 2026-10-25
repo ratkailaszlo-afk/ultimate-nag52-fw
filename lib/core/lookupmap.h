@@ -56,6 +56,7 @@ class LookupByteMap : public LookupMap {
         bool add_data(const uint8_t* map, const uint16_t size);
         ~LookupByteMap();
     private:
+        void release();
         int16_t* x_alloc;
         int16_t* y_alloc;
         int16_t* z_alloc;
