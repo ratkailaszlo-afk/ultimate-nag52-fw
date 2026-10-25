@@ -356,16 +356,12 @@ bool StandardProfile::should_upshift(GearboxGear current_gear, SensorData* senso
         uint16_t upshift_map_val = this->upshift_table->get_value(sensors->pedal_pos/2.5, (float)current_gear);
         // Add some extra RPM for catalyst warm up (+1000RPM at -10C, negated at 40C and higher)
         upshift_map_val += interpolate_float(sensors->atf_temp, 1000, 0, -10, 40, InterpType::Linear);
-        int time_since_last_shift = GET_CLOCK_TIME() - sensors->last_shift_time; // ms
-        // Increase the threshold higher RPMs closer to shift
-        // (Inverted since raw values are time SINCE shift)
-        upshift_map_val += interpolate_float(time_since_last_shift, 0, 1000, 5000, 0, InterpType::Linear);
-        int mmax = sensors->max_torque;
-        if (0 != mmax) {
-            // Score of 0-1
-            float engine_load_percent = (float)sensors->converted_driver_torque / (float)sensors->max_torque;
-            upshift_map_val += interpolate_float(engine_load_percent, 1000, 0, 0.8, 0.2, InterpType::Linear);
-        }
+        // The city S profile follows its pedal/input-RPM map directly when warm.
+        // Keep the original ATF warm-up compensation, bounded by this gear's
+        // full-pedal map threshold. Unverified CAN load scaling and the previous
+        // shift's age must not add further RPM to the city shift points.
+        const uint16_t full_pedal_limit = this->upshift_table->get_value(100.0f, (float)current_gear);
+        upshift_map_val = MIN(upshift_map_val, full_pedal_limit);
         bool can_upshift = sensors->input_rpm > upshift_map_val;
         if (sensors->pedal_pos == 0) {
             can_upshift = false;

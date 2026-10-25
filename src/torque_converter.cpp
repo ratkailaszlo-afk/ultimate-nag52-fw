@@ -147,12 +147,13 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
     InternalTccState targ = InternalTccState::Open;
     int slipping_rpm_targ = SLIP_V_WHEN_OPEN;
 
-    // Comfort keeps the converter open in first and across its shift transitions.
-    // Other profiles retain the global gear enables and all normal TCC conditions.
-    const bool comfort_first = profile != nullptr &&
-        profile->get_profile() == GearboxProfile::Comfort &&
+    // City S and Comfort keep TCC open in first, including transitions to/from it.
+    // Agility retains its existing global first-gear enable and normal conditions.
+    const bool city_first = profile != nullptr &&
+        (profile->get_profile() == GearboxProfile::Comfort ||
+         profile->get_profile() == GearboxProfile::Standard) &&
         (curr_gear == GearboxGear::First || targ_gear == GearboxGear::First);
-    bool can_enable_tcc = !comfort_first && sensors->atf_temp > -10 &&
+    bool can_enable_tcc = !city_first && sensors->atf_temp > -10 &&
         sensors->input_rpm > rpm_map_y_headers[0];
 
     if (
