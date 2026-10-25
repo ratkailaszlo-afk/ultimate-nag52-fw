@@ -128,7 +128,8 @@ uint8_t ReleasingShift::step_internal(
         }
 
         if (emergency_limit) {
-            this->torque_req_out = intervension_out;
+            // Apply the limit immediately and carry the bounded request into the next ramp cycle.
+            this->torque_req_val = MIN(intervension_out, sd->indicated_torque);
         }
         else {
             if (trq_req_up_ramp) {

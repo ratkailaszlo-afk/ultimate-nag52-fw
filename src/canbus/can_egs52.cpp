@@ -1,4 +1,5 @@
 #include "can_egs52.h"
+#include <cmath>
 #include "driver/twai.h"
 #include "board_config.h"
 #include "nvs/eeprom_config.h"
@@ -793,11 +794,13 @@ void Egs52Can::set_display_msg(GearboxMessage msg) {
 }
 
 void Egs52Can::set_wheel_torque_multi_factor(float ratio) {
-    if (ratio == -1) {
-        gs418.FMRAD = 0x7FF; // Implausible
+    if (!std::isfinite(ratio) || ratio < 0.0F) {
+        gs418.FMRAD = 0x7FF; // Signal unavailable; preserves the engine-off -1 sentinel.
     } else {
-        uint16_t fmrad_int = MIN((uint16_t)(ratio * 0.05), 2046);
-        gs418.FMRAD = fmrad_int;
+        // EGS52 FMRAD has 0.05 resolution: physical ratio -> raw is ratio * 20.
+        // Clamp before converting; 0x7FF is reserved for unavailable data.
+        const float scaled = ratio * 20.0F;
+        gs418.FMRAD = scaled >= 2046.0F ? 2046 : static_cast<uint16_t>(scaled);
     }
 }
 
