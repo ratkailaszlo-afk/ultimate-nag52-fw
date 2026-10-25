@@ -705,14 +705,16 @@ void Egs53Can::on_rx_frame(uint32_t id,  uint8_t dlc, uint64_t data, const uint3
     }   
 }
 
-void Egs53Can::on_rx_done(const uint32_t now_ts) {
+void Egs53Can::on_rx_done(const uint32_t) {
     if (nullptr != shifter) {
         switch (VEHICLE_CONFIG.shifter_style)
         {
         case (uint8_t)ShifterStyle::EWM:
         {
             ShifterEwm *shifterewm = reinterpret_cast<ShifterEwm *>(shifter);
-            shifterewm->set_program_button_pressed(get_profile_btn_press(now_ts), get_profile_switch_pos(now_ts));
+            shifterewm->set_program_button_pressed(
+                get_profile_btn_press(CanSignalExpiryMs::PROFILE_INPUT),
+                get_profile_switch_pos(CanSignalExpiryMs::PROFILE_INPUT));
             break;
         }
         case (uint8_t)ShifterStyle::ISM:

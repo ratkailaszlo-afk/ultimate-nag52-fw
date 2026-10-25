@@ -23,6 +23,14 @@
 #include "../shifter/programselector/programselector.h"
 #include "../profiles.h"
 
+namespace CanSignalExpiryMs {
+    // Match the existing 500 ms EWM selector freshness guard.
+    constexpr uint32_t PROFILE_INPUT = 500;
+    // Match the established brake-pedal and wheel signal budgets used by the gearbox path.
+    constexpr uint32_t TRRS_BRAKE = 250;
+    constexpr uint32_t TRRS_WHEEL = 100;
+}
+
 const CanTorqueData TORQUE_NDEF = {
     .m_min = INT16_MAX,
     .m_max = INT16_MAX,

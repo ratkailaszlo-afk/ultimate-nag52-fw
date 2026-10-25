@@ -1,6 +1,7 @@
 #ifndef UNIT_TEST
 
 #include "clock.hpp"
+#include "runtime_monitor.h"
 #include "embed_data.h"
 
 #include "solenoids/solenoids.h"
@@ -309,6 +310,7 @@ const char *post_code_to_str(SPEAKER_POST_CODE s)
 
 extern "C" void app_main(void)
 {
+    RuntimeMonitor::init();
     // Capture diagnostics before setup_tcm starts CAN and gearbox tasks.
     UartConsole::init();
     esp_log_level_set("gpio", esp_log_level_t::ESP_LOG_NONE);
@@ -317,6 +319,8 @@ extern "C" void app_main(void)
     egs_can_hal = nullptr;
     pressure_manager = nullptr;
     SPEAKER_POST_CODE s = setup_tcm();
+    if (s == SPEAKER_POST_CODE::SENSOR_FAIL)
+        RuntimeMonitor::fault(RuntimeMonitor::Counter::SensorInitError);
     xTaskCreate(err_beep_loop, "PCSPKR", 1024, reinterpret_cast<void*>(s), 2, nullptr);
     
     // Now spin up the KWP2000 server (last thing)

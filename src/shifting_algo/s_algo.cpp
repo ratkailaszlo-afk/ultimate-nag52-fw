@@ -1,6 +1,16 @@
 #include "s_algo.h"
 #include <egs_calibration/calibration_structs.h>
 #include "nvs/module_settings.h"
+#include <cmath>
+#include <limits>
+
+namespace {
+// abs_input_trq is uint16_t and both accumulators are int32_t. Capping the
+// sample count at this bound keeps even UINT16_MAX torque samples in-range.
+constexpr uint16_t MAX_SAFE_TORQUE_ADAPT_SAMPLES =
+    static_cast<uint16_t>(std::numeric_limits<int32_t>::max() /
+                          std::numeric_limits<uint16_t>::max());
+}
 
 void ShiftingAlgorithm::reset_all_subphase_data() {
     this->subphase_mod = 0;
@@ -390,11 +400,26 @@ short ShiftingAlgorithm::calc_correction_trq(ShiftStyle style, short momentum) {
     int32_t d_v = (d * (error - momentum_pid[0])) / 1000;
     momentum_pid[0] = error;
 
-    int32_t ret = MAX(INT16_MIN, MIN(INT16_MAX, p_v + i_v + d_v));
+    // Sum in 64 bits so extreme PID settings cannot overflow before clamp.
+    const int64_t raw_ret = static_cast<int64_t>(p_v) + i_v + d_v;
+    const int32_t ret = raw_ret < std::numeric_limits<int16_t>::min()
+        ? std::numeric_limits<int16_t>::min()
+        : (raw_ret > std::numeric_limits<int16_t>::max()
+            ? std::numeric_limits<int16_t>::max()
+            : static_cast<int32_t>(raw_ret));
     if (this->do_torque_adaptation) {
-        this->pid_sum += ret;
-        this->abs_sum += this->abs_input_trq;
-        this->pid_count += 1;
+        if (this->pid_count < MAX_SAFE_TORQUE_ADAPT_SAMPLES) {
+            const int64_t next_pid_sum = static_cast<int64_t>(this->pid_sum) + ret;
+            const int64_t next_abs_sum = static_cast<int64_t>(this->abs_sum) + this->abs_input_trq;
+            if (next_pid_sum >= std::numeric_limits<int32_t>::min() &&
+                next_pid_sum <= std::numeric_limits<int32_t>::max() &&
+                next_abs_sum >= 0 &&
+                next_abs_sum <= std::numeric_limits<int32_t>::max()) {
+                this->pid_sum = static_cast<int32_t>(next_pid_sum);
+                this->abs_sum = static_cast<int32_t>(next_abs_sum);
+                this->pid_count += 1;
+            }
+        }
     }
     return (short)ret;
 }
@@ -477,9 +502,10 @@ void ShiftingAlgorithm::adaptation_step() {
         // 3-4 -> 3-4
         // 4-5 -> 4-5 and 5-4
         // 4-3 -> 4-3
-        uint8_t allowed_crossover_shifts[8] = {1,1,1,1,0,0,1,0};
+        const uint8_t allowed_crossover_shifts[8] = {1,1,1,1,0,0,1,0};
         this->do_fill_pressure_adaptation = this->do_fill_time_adaptation;
-        if (this->is_release_shift() || allowed_crossover_shifts[sid->inf.map_idx] == 0) {
+        if (sid->inf.map_idx >= (sizeof(allowed_crossover_shifts) / sizeof(allowed_crossover_shifts[0])) ||
+            this->is_release_shift() || allowed_crossover_shifts[sid->inf.map_idx] == 0) {
             this->do_fill_pressure_adaptation = false;
         }
         this->fill_pressure_adaptation_stage = 1;
@@ -520,10 +546,11 @@ void ShiftingAlgorithm::adaptation_step() {
             }
         }
     } else if (4 == fill_pressure_adaptation_stage) {
-        if (this->timer_p_adapt != 0 && this->adapting_turbine_spd != 0) {
+        const int time = 0xFF - this->timer_p_adapt;
+        if (this->timer_p_adapt != 0 && time > 0 && this->adapting_turbine_spd != 0 &&
+            sid->inf.map_idx < 8 && MECH_PTR != nullptr) {
             // 4 runs no matter what, so we don't care about if we are allowed or not
-            int time = 0xFF - this->timer_p_adapt;
-            int avg_trq = this->adapting_p_adapt_trq / time;
+            const int avg_trq = this->adapting_p_adapt_trq / time;
             int d_inertia = ((MECH_PTR->intertia_torque[sid->inf.map_idx]) * (this->adapting_turbine_spd - sd->input_rpm)) / (time*20);
             int correction_p = 0;
             if (this->upshifting) {
@@ -534,18 +561,34 @@ void ShiftingAlgorithm::adaptation_step() {
             correction_p = MAX(-200, MIN(correction_p, 60));
             if (0 != correction_p) {
                 if (sid->adaptation_mgr) {
-                    int old_v = sid->adaptation_mgr->get_adapt_spc_offset(this->adapt_p_map_idx());
-
-                    float scalar = interpolate_float(time, 0.25, 0.5, 4, 8, InterpType::Linear);
-                    int new_v = (int)((float)old_v + (float)correction_p * scalar);
-                    int lim = (2000*sid->inf.pressure_multi_spc_int)/1000;
-                    if (new_v > sid->inf.pressure_multi_spc_int) {
-                        new_v = lim;
-                    } else if (new_v < -lim) {
-                        new_v = -lim;
+                    const uint8_t adaptation_idx = this->adapt_p_map_idx();
+                    if (sid->inf.pressure_multi_spc_int <= 0 || adaptation_idx >= 8) {
+                        ESP_LOGW("ADAPT", "Pressure adaptation cancelled (invalid SPC pressure multiplier)");
                     }
-                    ESP_LOGI("ADAPT", "P_ADAPT end. Res: %d mBar (Timer = %d, AVG_T = %d Nm, Inertia %d Nm)", correction_p, time, avg_trq, d_inertia);
-                    sid->adaptation_mgr->offset_spc_pressure(this->adapt_p_map_idx(), new_v-old_v);
+                    else {
+                        int old_v = sid->adaptation_mgr->get_adapt_spc_offset(adaptation_idx);
+
+                        float scalar = interpolate_float(time, 0.25, 0.5, 4, 8, InterpType::Linear);
+                        const int64_t requested_lim =
+                            (2000LL * static_cast<int64_t>(sid->inf.pressure_multi_spc_int)) / 1000LL;
+                        const int32_t lim = requested_lim > std::numeric_limits<int16_t>::max()
+                            ? std::numeric_limits<int16_t>::max()
+                            : static_cast<int32_t>(requested_lim);
+                        const float proposed = static_cast<float>(old_v) +
+                                               static_cast<float>(correction_p) * scalar;
+                        int32_t new_v = old_v;
+                        if (std::isfinite(proposed)) {
+                            if (proposed > lim) {
+                                new_v = lim;
+                            } else if (proposed < -lim) {
+                                new_v = -lim;
+                            } else {
+                                new_v = static_cast<int32_t>(proposed);
+                            }
+                        }
+                        ESP_LOGI("ADAPT", "P_ADAPT end. Res: %d mBar (Timer = %d, AVG_T = %d Nm, Inertia %d Nm)", correction_p, time, avg_trq, d_inertia);
+                        sid->adaptation_mgr->offset_spc_pressure(adaptation_idx, new_v-old_v);
+                    }
                 }
                 fill_pressure_adaptation_stage = 5;
             } else {
@@ -612,8 +655,11 @@ void ShiftingAlgorithm::adaptation_step() {
     } else if (this->torque_adaptation_stage == 2 && this->do_torque_adaptation) {
         // Analyze phase
         if (this->pid_count != 0 && nullptr != sid->adaptation_mgr) {
+            // Preserve the legacy integer PID mean; the absolute torque mean
+            // must use the accumulated samples and floating-point division.
             float avg_pid_torque = this->pid_sum / this->pid_count;
-            float avg_abs_torque = this->abs_input_trq / this->pid_count;
+            float avg_abs_torque = static_cast<float>(this->abs_sum) /
+                                   static_cast<float>(this->pid_count);
             float scalar = interpolate_float(
                 avg_abs_torque,
                 0.10, // 10% at low torque

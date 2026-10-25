@@ -1,0 +1,873 @@
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+
+#include "shift_adaptation.h"
+
+#define ESP_LOGI(...) ((void)0)
+#define ESP_LOGW(...) ((void)0)
+#define ESP_LOGE(...) ((void)0)
+#define MAX(a, b) (((a) > (b)) ? (a) : (b))
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+
+#define NVS_KEY_MAP_NAME_ADAPT_PREFILL_TIME "adapt-prefill"
+#define NVS_KEY_MAP_NAME_ADAPT_APPLYING_TRQ "adapt-applying"
+#define NVS_KEY_MAP_NAME_ADAPT_FREEING_TRQ "adapt-freeing"
+#define NVS_KEY_MAP_NAME_ADAPT_SPC_OFFSET "adapt-spc"
+
+constexpr int16_t GEAR_ADAPT_MAP[8] = {0,0,0,0,0,0,0,0};
+constexpr int TCC_SLIP_ADAPT_MAP_SIZE = 65;
+constexpr int race = 1;
+constexpr uint32_t SHIFT_FLAG_COAST_54_43 = 1u << 0;
+constexpr uint32_t SHIFT_FLAG_COAST = 1u << 1;
+
+struct AdaptSettings {
+    int16_t min_atf_temp = 60;
+    int16_t max_atf_temp = 110;
+    uint16_t min_input_rpm = 1000;
+    uint16_t max_input_rpm = 3000;
+    bool prefill_adapt_k1 = false;
+    bool prefill_adapt_k2 = false;
+    bool prefill_adapt_k3 = false;
+    bool prefill_adapt_b1 = false;
+    bool prefill_adapt_b2 = false;
+    uint16_t prefill_max_time_delta = 200;
+    bool adapt_trq_1_2 = false;
+    bool adapt_trq_2_3 = false;
+    bool adapt_trq_3_4 = false;
+    bool adapt_trq_4_5 = false;
+    bool adapt_trq_2_1 = false;
+    bool adapt_trq_3_2 = false;
+    bool adapt_trq_4_3 = false;
+    bool adapt_trq_5_4 = false;
+    bool adaptation_when_manual_shifting = false;
+};
+AdaptSettings ADP_CURRENT_SETTINGS{};
+
+struct PidSettings {
+    int16_t pid_p_val_upshift = 0;
+    int16_t pid_i_val_upshift = 0;
+    int16_t pid_d_val_upshift = 0;
+    int16_t pid_p_val_downshift = 0;
+    int16_t pid_i_val_downshift = 0;
+    int16_t pid_d_val_downshift = 0;
+};
+PidSettings CRS_CURRENT_SETTINGS{};
+PidSettings REL_CURRENT_SETTINGS{};
+
+struct VehicleSettings { float engine_drag_torque = 1000.0f; };
+VehicleSettings VEHICLE_CONFIG{};
+
+enum class Clutch { K1, K2, K3, B1, B2, Other };
+enum class GearChange { _1_2, _2_1, _2_3, _3_2, _3_4, _4_5, _5_4, _4_3, Other };
+enum class GearboxGear { First, Second, Third, Fourth, Fifth, Reverse };
+enum class CoefficientTy { Sliding };
+enum class InterpType { Linear };
+enum class ShiftStyle { Crossover_Up, Crossover_Dn, Release_Up, Release_Dn };
+
+struct CircuitInfo {
+    uint8_t map_idx = 0;
+    int pressure_multi_spc_int = 1000;
+};
+struct ShiftClutchData {
+    int off_clutch_speed = 0;
+    int on_clutch_speed = 100;
+};
+struct ShiftInterfaceData {
+    int profile = 0;
+    GearChange change = GearChange::_1_2;
+    Clutch applying = Clutch::K1;
+    bool manual_shift = false;
+    uint32_t shift_flags = 0;
+    CircuitInfo inf{};
+    int release_spring_on_clutch = 0;
+    GearboxGear targ_g = GearboxGear::Second;
+    ShiftClutchData* ptr_r_clutch_speeds = nullptr;
+    ShiftAdaptationSystem* adaptation_mgr = nullptr;
+};
+struct SensorData {
+    int16_t atf_temp = 80;
+    uint16_t tcc_trq_multiplier = 0;
+    uint16_t pump_torque = 0;
+    uint16_t indicated_torque = 0;
+    uint16_t input_rpm = 2000;
+    uint16_t engine_rpm = 2000;
+    uint16_t input_torque = 0;
+};
+struct Mechanics { int intertia_torque[8] = {0,0,0,0,0,0,0,0}; };
+Mechanics g_mechanics{};
+Mechanics* MECH_PTR = &g_mechanics;
+
+class PressureManager {
+public:
+    int signed_pressure_result = 0;
+    int max_torque_result = 0;
+    int signed_pressure_calls = 0;
+    int calc_max_torque_for_clutch(GearboxGear, Clutch, int, CoefficientTy) {
+        return max_torque_result;
+    }
+    int p_clutch_with_coef_signed(GearboxGear, Clutch, int, CoefficientTy) {
+        ++signed_pressure_calls;
+        return signed_pressure_result;
+    }
+};
+
+int first_order_filter(int, int input, int) { return input; }
+float interpolate_float(float raw, float new_min, float new_max,
+                        float raw_min, float raw_max, InterpType) {
+    if (raw_max < raw_min) {
+        std::swap(raw_max, raw_min);
+        std::swap(new_max, new_min);
+    }
+    if (raw <= raw_min) return new_min;
+    if (raw >= raw_max) return new_max;
+    return new_min + ((new_max - new_min) * (raw - raw_min) / (raw_max - raw_min));
+}
+namespace ShiftHelpers {
+float get_shift_intertia(uint8_t) { return 10.0f; }
+}
+
+class TestShiftAlgo {
+public:
+    explicit TestShiftAlgo(ShiftInterfaceData* data, SensorData* sensors, PressureManager* pressure)
+        : sid(data), sd(sensors), pm(pressure) {}
+    bool is_release_shift() const { return release_shift; }
+    uint8_t adapt_p_map_idx();
+    short calc_correction_trq(ShiftStyle style, short momentum);
+    void adaptation_step();
+
+    ShiftInterfaceData* sid;
+    SensorData* sd;
+    PressureManager* pm;
+    bool release_shift = false;
+    bool upshifting = true;
+    int16_t target_turbine_speed = 0;
+    int centrifugal_force_on_clutch = 0;
+    int p_apply_clutch = 0;
+    uint16_t abs_input_trq = 0;
+    int16_t first_order_pump_trq_filter = 0;
+    int32_t momentum_pid[3] = {0,0,0};
+    int32_t pid_sum = 0;
+    int32_t abs_sum = 0;
+    uint16_t pid_count = 0;
+    bool do_fill_time_adaptation = false;
+    bool do_fill_pressure_adaptation = false;
+    bool do_torque_adaptation = false;
+    uint8_t timer_p_adapt = 0;
+    uint16_t adapting_trq_limit = 0;
+    uint16_t adapting_turbine_spd = 0;
+    int adapting_p_adapt_trq = 0;
+    uint8_t fill_time_adaptation_stage = 0;
+    uint8_t fill_pressure_adaptation_stage = 0;
+    uint8_t torque_adaptation_stage = 0;
+    uint8_t phase_id = 0;
+};
+
+@@SHIFT_ADAPTATION_METHODS@@
+@@S_ALGO_METHODS@@
+
+class TestTorqueConverterSave {
+public:
+    StoredMap* tcc_lock_map = nullptr;
+    StoredMap* tcc_slip_map = nullptr;
+    @@TCC_SAVE_METHOD@@
+};
+
+static int assertion_count = 0;
+static void require(bool ok, const char* message) {
+    ++assertion_count;
+    if (!ok) {
+        std::fprintf(stderr, "ASSERTION FAILED: %s\n", message);
+        std::abort();
+    }
+}
+
+static void cleanup(ShiftAdaptationSystem& manager) {
+    delete manager.prefill_time_map;
+    delete manager.applying_torque_offset;
+    delete manager.freeing_torque_offset;
+    delete manager.spc_offset_map;
+    manager.prefill_time_map = nullptr;
+    manager.applying_torque_offset = nullptr;
+    manager.freeing_torque_offset = nullptr;
+    manager.spc_offset_map = nullptr;
+}
+
+static std::array<int16_t, 4> normal_map_path() {
+    ShiftAdaptationSystem manager;
+#ifdef SA12_CANDIDATE
+    manager.init_shift();
+#endif
+    manager.prefill_time_map->data[0] = 10;
+    manager.spc_offset_map->data[0] = -20;
+    manager.freeing_torque_offset->data[0] = 30;
+    manager.applying_torque_offset->data[0] = -40;
+    manager.offset_prefill_cycles(0, 5);
+    manager.offset_spc_pressure(0, 7);
+    manager.offset_freeing_trq(0, -3);
+    manager.offset_applying_trq(0, 9);
+    std::array<int16_t, 4> result = {
+        manager.get_prefill_cycles_offset(0),
+        manager.get_adapt_spc_offset(0),
+        manager.get_freeing_torque_offset(0),
+        manager.get_applying_torque_offset(0)
+    };
+    cleanup(manager);
+    return result;
+}
+
+static bool learning_off_unchanged() {
+    ShiftAdaptationSystem manager;
+#ifdef SA12_CANDIDATE
+    manager.init_shift();
+#endif
+    manager.prefill_time_map->data[0] = 11;
+    manager.spc_offset_map->data[0] = 12;
+    manager.freeing_torque_offset->data[0] = 13;
+    manager.applying_torque_offset->data[0] = 14;
+    const std::array<int16_t, 4> before = {11,12,13,14};
+
+    ShiftClutchData speeds{};
+    ShiftInterfaceData sid{};
+    sid.ptr_r_clutch_speeds = &speeds;
+    sid.adaptation_mgr = &manager;
+    SensorData sensors{};
+    PressureManager pm{};
+    TestShiftAlgo algo(&sid, &sensors, &pm);
+    algo.fill_pressure_adaptation_stage = 5;
+    algo.fill_time_adaptation_stage = 0;
+    algo.torque_adaptation_stage = 0;
+    ADP_CURRENT_SETTINGS.prefill_adapt_k1 = false;
+    ADP_CURRENT_SETTINGS.prefill_adapt_k2 = false;
+    ADP_CURRENT_SETTINGS.prefill_adapt_k3 = false;
+    ADP_CURRENT_SETTINGS.prefill_adapt_b1 = false;
+    ADP_CURRENT_SETTINGS.prefill_adapt_b2 = false;
+    ADP_CURRENT_SETTINGS.adapt_trq_1_2 = false;
+    ADP_CURRENT_SETTINGS.adapt_trq_2_3 = false;
+    ADP_CURRENT_SETTINGS.adapt_trq_3_4 = false;
+    ADP_CURRENT_SETTINGS.adapt_trq_4_5 = false;
+    ADP_CURRENT_SETTINGS.adapt_trq_2_1 = false;
+    ADP_CURRENT_SETTINGS.adapt_trq_3_2 = false;
+    ADP_CURRENT_SETTINGS.adapt_trq_4_3 = false;
+    ADP_CURRENT_SETTINGS.adapt_trq_5_4 = false;
+    algo.adaptation_step();
+    const bool unchanged =
+        manager.prefill_time_map->data[0] == before[0] &&
+        manager.spc_offset_map->data[0] == before[1] &&
+        manager.freeing_torque_offset->data[0] == before[2] &&
+        manager.applying_torque_offset->data[0] == before[3] &&
+        !algo.do_torque_adaptation;
+    cleanup(manager);
+    return unchanged;
+}
+
+static int average_torque_offset_result() {
+    ShiftAdaptationSystem manager;
+#ifdef SA12_CANDIDATE
+    manager.init_shift();
+#endif
+    manager.applying_torque_offset->data[0] = 0;
+    ShiftClutchData speeds{};
+    ShiftInterfaceData sid{};
+    sid.ptr_r_clutch_speeds = &speeds;
+    sid.adaptation_mgr = &manager;
+    sid.change = GearChange::_1_2;
+    sid.applying = Clutch::K1;
+    sid.inf.map_idx = 0;
+    SensorData sensors{};
+    sensors.input_rpm = 2000;
+    sensors.engine_rpm = 2000;
+    PressureManager pm{};
+    TestShiftAlgo algo(&sid, &sensors, &pm);
+    algo.fill_time_adaptation_stage = 1;
+    algo.fill_pressure_adaptation_stage = 5;
+    algo.torque_adaptation_stage = 2;
+    algo.do_torque_adaptation = true;
+    algo.pid_sum = 1000;
+    algo.abs_sum = 1005;
+    algo.pid_count = 10;
+    algo.abs_input_trq = 1000;
+    VEHICLE_CONFIG.engine_drag_torque = 1000.0f;
+    algo.adaptation_step();
+    const int result = manager.applying_torque_offset->data[0];
+    cleanup(manager);
+    return result;
+}
+
+static int spc_positive_limit_result(int old_value, int multiplier, int pressure_result) {
+    ShiftAdaptationSystem manager;
+#ifdef SA12_CANDIDATE
+    manager.init_shift();
+#endif
+    manager.spc_offset_map->data[0] = static_cast<int16_t>(old_value);
+    ShiftClutchData speeds{};
+    ShiftInterfaceData sid{};
+    sid.ptr_r_clutch_speeds = &speeds;
+    sid.adaptation_mgr = &manager;
+    sid.change = GearChange::_1_2;
+    sid.inf.map_idx = 0;
+    sid.inf.pressure_multi_spc_int = multiplier;
+    SensorData sensors{};
+    sensors.input_rpm = 3000;
+    sensors.engine_rpm = 3000;
+    PressureManager pm{};
+    pm.signed_pressure_result = pressure_result;
+    TestShiftAlgo algo(&sid, &sensors, &pm);
+    algo.fill_time_adaptation_stage = 1;
+    algo.fill_pressure_adaptation_stage = 4;
+    algo.torque_adaptation_stage = 5;
+    algo.timer_p_adapt = 0xFC; // One loop decrement leaves four accumulated cycles.
+    algo.adapting_turbine_spd = 3000;
+    algo.adapting_p_adapt_trq = 0;
+    algo.do_torque_adaptation = false;
+    g_mechanics.intertia_torque[0] = 0;
+    algo.adaptation_step();
+    const int result = manager.spc_offset_map->data[0];
+    cleanup(manager);
+    return result;
+}
+
+static uint64_t normal_pid_regression(uint32_t max_observed_input_rpm,
+                                     int observed_slip_min_rpm,
+                                     int observed_slip_max_rpm) {
+    @@NORMAL_PID_SETTINGS@@
+    const int error_cases[3] = {observed_slip_min_rpm, 0, observed_slip_max_rpm};
+    constexpr uint64_t fnv_offset = 14695981039346656037ULL;
+    constexpr uint64_t fnv_prime = 1099511628211ULL;
+    uint64_t hash = fnv_offset;
+    const ShiftStyle styles[4] = {
+        ShiftStyle::Crossover_Up, ShiftStyle::Crossover_Dn,
+        ShiftStyle::Release_Up, ShiftStyle::Release_Dn
+    };
+    for (const ShiftStyle style : styles) {
+        ShiftClutchData speeds{};
+        ShiftInterfaceData sid{};
+        sid.ptr_r_clutch_speeds = &speeds;
+        SensorData sensors{};
+        PressureManager pm{};
+        TestShiftAlgo algo(&sid, &sensors, &pm);
+        algo.upshifting = style == ShiftStyle::Crossover_Up || style == ShiftStyle::Release_Up;
+        algo.do_torque_adaptation = false;
+        for (uint32_t input_rpm = 1; input_rpm <= max_observed_input_rpm; ++input_rpm) {
+            sensors.input_rpm = static_cast<uint16_t>(input_rpm);
+            for (const int error_rpm : error_cases) {
+                // Target delta uses the observed converter-slip extrema only
+                // as a conservative synthetic RPM-error envelope. It is not
+                // claimed to be a measured turbine target error.
+                algo.target_turbine_speed = static_cast<int16_t>(
+                    static_cast<int32_t>(input_rpm) - error_rpm);
+                algo.momentum_pid[0] = 0;
+                algo.momentum_pid[1] = 0;
+                const short output = algo.calc_correction_trq(style, 0);
+                hash ^= static_cast<uint16_t>(output);
+                hash *= fnv_prime;
+                hash ^= static_cast<uint16_t>(algo.momentum_pid[1]);
+                hash *= fnv_prime;
+                hash ^= static_cast<uint16_t>(algo.target_turbine_speed);
+                hash *= fnv_prime;
+            }
+        }
+    }
+    return hash;
+}
+
+static void test_candidate_guards_and_saturation() {
+    ShiftAdaptationSystem manager;
+    manager.init_shift();
+    require(manager.prefill_time_map->data[0] == 0, "prefill map default remains zero");
+
+    // Index 8 and 255 must be harmless for every getter and setter.
+    manager.prefill_time_map->data[0] = 20;
+    manager.spc_offset_map->data[0] = 21;
+    manager.freeing_torque_offset->data[0] = 22;
+    manager.applying_torque_offset->data[0] = 23;
+    require(manager.get_prefill_cycles_offset(8) == 0, "invalid prefill index getter");
+    require(manager.get_adapt_spc_offset(8) == 0, "invalid SPC index getter");
+    require(manager.get_freeing_torque_offset(8) == 0, "invalid freeing index getter");
+    require(manager.get_applying_torque_offset(8) == 0, "invalid applying index getter");
+    manager.offset_prefill_cycles(8, 4);
+    manager.offset_spc_pressure(8, 4);
+    manager.offset_freeing_trq(8, 4);
+    manager.offset_applying_trq(8, 4);
+    manager.offset_prefill_cycles(255, 4);
+    manager.offset_spc_pressure(255, 4);
+    manager.offset_freeing_trq(255, 4);
+    manager.offset_applying_trq(255, 4);
+    require(manager.prefill_time_map->data[0] == 20 &&
+            manager.spc_offset_map->data[0] == 21 &&
+            manager.freeing_torque_offset->data[0] == 22 &&
+            manager.applying_torque_offset->data[0] == 23,
+            "invalid indices do not mutate cell zero");
+
+    manager.prefill_time_map->data[0] = 200;
+    require(manager.get_prefill_cycles_offset(0) == INT8_MAX, "prefill getter saturates positive int8");
+    manager.prefill_time_map->data[0] = -200;
+    require(manager.get_prefill_cycles_offset(0) == INT8_MIN, "prefill getter saturates negative int8");
+    manager.prefill_time_map->data[0] = INT16_MAX;
+    manager.offset_prefill_cycles(0, INT8_MAX);
+    require(manager.prefill_time_map->data[0] == 200, "prefill setter enforces configured positive bound");
+    manager.prefill_time_map->data[0] = INT16_MIN;
+    manager.offset_prefill_cycles(0, INT8_MIN);
+    require(manager.prefill_time_map->data[0] == -200, "prefill setter enforces configured negative bound");
+
+    manager.spc_offset_map->data[0] = INT16_MAX;
+    manager.offset_spc_pressure(0, INT32_MAX);
+    require(manager.spc_offset_map->data[0] == INT16_MAX, "SPC setter saturates int16 positive");
+    manager.spc_offset_map->data[0] = INT16_MIN;
+    manager.offset_spc_pressure(0, INT32_MIN);
+    require(manager.spc_offset_map->data[0] == INT16_MIN, "SPC setter saturates int16 negative");
+    manager.freeing_torque_offset->data[0] = INT16_MAX;
+    manager.offset_freeing_trq(0, INT32_MAX);
+    require(manager.freeing_torque_offset->data[0] == INT16_MAX, "freeing setter saturates int16");
+    manager.applying_torque_offset->data[0] = INT16_MIN;
+    manager.offset_applying_trq(0, INT32_MIN);
+    require(manager.applying_torque_offset->data[0] == INT16_MIN, "applying setter saturates int16");
+
+    StoredMap* const saved_prefill = manager.prefill_time_map;
+    manager.prefill_time_map = nullptr;
+    require(manager.get_prefill_cycles_offset(0) == 0, "missing prefill map getter");
+    require(manager.save() == ESP_ERR_INVALID_STATE, "missing map save status");
+    require(manager.reset() == ESP_ERR_INVALID_STATE, "missing map reset status");
+    manager.prefill_time_map = saved_prefill;
+    manager.init_shift();
+
+    manager.spc_offset_map->null_data = true;
+    manager.init_shift();
+    require(manager.get_adapt_spc_offset(0) == 0, "null map data getter");
+    require(manager.save() == ESP_ERR_INVALID_STATE, "null map data save status");
+    manager.spc_offset_map->null_data = false;
+    manager.init_shift();
+
+    manager.freeing_torque_offset->size = 7;
+    manager.init_shift();
+    require(manager.save() == ESP_ERR_INVALID_STATE, "wrong map element count save status");
+    manager.freeing_torque_offset->size = 8;
+    manager.freeing_torque_offset->x_size = 4;
+    manager.freeing_torque_offset->y_size = 2;
+    manager.init_shift();
+    require(manager.get_freeing_torque_offset(0) == 0,
+            "wrong map axes shape getter guard");
+    require(manager.save() == ESP_ERR_INVALID_STATE,
+            "wrong map axes shape save guard");
+    manager.freeing_torque_offset->x_size = 8;
+    manager.freeing_torque_offset->y_size = 1;
+    manager.freeing_torque_offset->init_result = ESP_ERR_NO_MEM;
+    manager.init_shift();
+    require(manager.reset() == ESP_ERR_INVALID_STATE, "failed map load reset status");
+    manager.freeing_torque_offset->init_result = ESP_OK;
+    manager.init_shift();
+
+    manager.applying_torque_offset->allocated = false;
+    manager.init_shift();
+    require(manager.get_applying_torque_offset(0) == 0, "unallocated map getter");
+    require(manager.save() == ESP_ERR_INVALID_STATE, "unallocated map save status");
+    manager.applying_torque_offset->allocated = true;
+    manager.init_shift();
+
+    // Save first-error order: prefill, applying, freeing, SPC.
+    StoredMap* save_order[] = {manager.prefill_time_map, manager.applying_torque_offset,
+                               manager.freeing_torque_offset, manager.spc_offset_map};
+    for (int fail_at = 0; fail_at < 4; ++fail_at) {
+        for (auto* map : save_order) {
+            map->save_calls = 0;
+            map->save_result = ESP_OK;
+        }
+        const esp_err_t expected = 0x500 + fail_at;
+        save_order[fail_at]->save_result = expected;
+        require(manager.save() == expected, "save returns first map error");
+        for (int i = 0; i < 4; ++i) {
+            require(save_order[i]->save_calls == (i <= fail_at ? 1 : 0),
+                    "save stops after first map error");
+        }
+    }
+
+    // Reset first-error order is prefill, SPC, freeing, applying. A prior
+    // successful reset may change RAM before the first error; no atomicity
+    // is asserted.
+    StoredMap* reset_order[] = {manager.prefill_time_map, manager.spc_offset_map,
+                                manager.freeing_torque_offset, manager.applying_torque_offset};
+    for (int fail_at = 0; fail_at < 4; ++fail_at) {
+        for (auto* map : reset_order) {
+            map->add_data_calls = 0;
+            map->save_calls = 0;
+            map->save_result = ESP_OK;
+            map->allow_add_data = true;
+            map->data[0] = 77;
+        }
+        reset_order[fail_at]->allow_add_data = false;
+        require(manager.reset() == ESP_ERR_INVALID_STATE, "reset returns replace failure");
+        for (int i = 0; i < 4; ++i) {
+            require(reset_order[i]->add_data_calls == (i <= fail_at ? 1 : 0),
+                    "reset stops after first map error");
+            require(reset_order[i]->save_calls == (i < fail_at ? 1 : 0),
+                    "reset saves only maps replaced before the first error");
+        }
+        for (int i = 0; i < fail_at; ++i) {
+            require(reset_order[i]->data[0] == 0, "earlier successful reset may change RAM before later error");
+        }
+        require(reset_order[fail_at]->data[0] == 77,
+                "failed replacement leaves the failing map's RAM cell untouched");
+        for (int i = fail_at + 1; i < 4; ++i) {
+            require(reset_order[i]->data[0] == 77, "later maps remain untouched after first error");
+        }
+    }
+
+    // EEPROM failure after replacement is also propagated at each reset
+    // position. The failing map has already changed RAM to defaults; later
+    // maps are untouched. This explicitly is not an atomic reset operation.
+    for (int fail_at = 0; fail_at < 4; ++fail_at) {
+        for (auto* map : reset_order) {
+            map->add_data_calls = 0;
+            map->save_calls = 0;
+            map->save_result = ESP_OK;
+            map->allow_add_data = true;
+            map->data[0] = 77;
+        }
+        const esp_err_t expected = 0x680 + fail_at;
+        reset_order[fail_at]->save_result = expected;
+        require(manager.reset() == expected, "reset returns first EEPROM save error");
+        for (int i = 0; i < 4; ++i) {
+            require(reset_order[i]->add_data_calls == (i <= fail_at ? 1 : 0),
+                    "reset replaces through first EEPROM save error");
+            require(reset_order[i]->save_calls == (i <= fail_at ? 1 : 0),
+                    "reset stops after first EEPROM save error");
+        }
+        for (int i = 0; i <= fail_at; ++i) {
+            require(reset_order[i]->data[0] == 0,
+                    "successful or failing EEPROM save follows RAM reset");
+        }
+        for (int i = fail_at + 1; i < 4; ++i) {
+            require(reset_order[i]->data[0] == 77,
+                    "later maps remain untouched after EEPROM save error");
+        }
+    }
+    cleanup(manager);
+}
+
+static void test_candidate_stored_map_reset_contract() {
+    const int16_t axes[8] = {0,1,2,3,4,5,6,7};
+    const int16_t y_axis[1] = {1};
+    const int16_t defaults[8] = {1,2,3,4,5,6,7,8};
+    StoredMap map("reset-contract", 8, axes, y_axis, 8, 1, defaults);
+
+    map.data[0] = 99;
+    require(map.reset_from_flash() == ESP_OK, "actual StoredMap reset succeeds");
+    require(map.data[0] == defaults[0] && map.data[7] == defaults[7],
+            "actual StoredMap reset replaces RAM with defaults");
+    require(map.add_data_calls == 1 && map.save_calls == 1,
+            "successful reset replaces once then saves once");
+
+    map.data[0] = 91;
+    map.allow_add_data = false;
+    const int add_before_replace_failure = map.add_data_calls;
+    const int saves_before_replace_failure = map.save_calls;
+    require(map.reset_from_flash() == ESP_ERR_INVALID_STATE,
+            "actual StoredMap reset propagates replace_data_content failure");
+    require(map.data[0] == 91, "replace failure leaves RAM unchanged");
+    require(map.add_data_calls == add_before_replace_failure + 1 &&
+            map.save_calls == saves_before_replace_failure,
+            "replace failure does not proceed to EEPROM save");
+
+    map.allow_add_data = true;
+    map.size = 7;
+    const int add_before_bad_length = map.add_data_calls;
+    const int saves_before_bad_length = map.save_calls;
+    require(map.reset_from_flash() == ESP_ERR_NVS_INVALID_LENGTH,
+            "actual StoredMap reset propagates malformed length failure");
+    require(map.data[0] == 91 && map.add_data_calls == add_before_bad_length &&
+            map.save_calls == saves_before_bad_length,
+            "malformed length does not call add_data or save");
+
+    map.size = 8;
+    map.save_result = 0x630;
+    require(map.reset_from_flash() == 0x630,
+            "actual StoredMap reset propagates EEPROM save failure");
+    require(map.data[0] == defaults[0] && map.add_data_calls == add_before_bad_length + 1 &&
+            map.save_calls == saves_before_bad_length + 1,
+            "save failure follows a successful RAM replacement");
+}
+
+static void test_baseline_stored_map_reset_error_swallowed() {
+    const int16_t axes[8] = {0,1,2,3,4,5,6,7};
+    const int16_t y_axis[1] = {1};
+    const int16_t defaults[8] = {1,2,3,4,5,6,7,8};
+    StoredMap map("reset-baseline", 8, axes, y_axis, 8, 1, defaults);
+    map.data[0] = 99;
+    map.allow_add_data = false;
+    require(map.reset_from_flash() == ESP_OK,
+            "SA11 negative control reproduces swallowed replace failure");
+    require(map.data[0] == 99 && map.save_calls == 0,
+            "SA11 negative control did not replace or save");
+}
+
+static void test_candidate_torque_accumulator_bound() {
+    CRS_CURRENT_SETTINGS.pid_p_val_upshift = 0;
+    CRS_CURRENT_SETTINGS.pid_i_val_upshift = 0;
+    CRS_CURRENT_SETTINGS.pid_d_val_upshift = 0;
+    ShiftClutchData speeds{};
+    ShiftInterfaceData sid{};
+    sid.ptr_r_clutch_speeds = &speeds;
+    SensorData sensors{};
+    sensors.input_rpm = 2000;
+    PressureManager pm{};
+    TestShiftAlgo algo(&sid, &sensors, &pm);
+    algo.do_torque_adaptation = true;
+    algo.abs_input_trq = UINT16_MAX;
+    const uint16_t max_samples = static_cast<uint16_t>(
+        std::numeric_limits<int32_t>::max() / std::numeric_limits<uint16_t>::max());
+    for (uint16_t i = 0; i < max_samples + 1; ++i) {
+        algo.calc_correction_trq(ShiftStyle::Crossover_Up, 0);
+    }
+    const int64_t expected_abs = static_cast<int64_t>(max_samples) * UINT16_MAX;
+    require(algo.pid_count == max_samples, "torque sample count saturates before wrap");
+    require(algo.abs_sum == expected_abs, "absolute torque sum remains representable");
+    require(algo.pid_sum == 0, "zero PID samples remain zero");
+
+    algo.pid_sum = INT32_MAX;
+    algo.abs_sum = INT32_MAX;
+    algo.pid_count = 1;
+    const auto pid_before = algo.pid_sum;
+    const auto abs_before = algo.abs_sum;
+    algo.calc_correction_trq(ShiftStyle::Crossover_Up, 0);
+    require(algo.pid_sum == pid_before && algo.abs_sum == abs_before && algo.pid_count == 1,
+            "accumulator overflow sample is rejected without mutation");
+
+    algo.pid_sum = 0;
+    algo.abs_sum = 0;
+    algo.pid_count = 0;
+    algo.abs_input_trq = 0;
+    sensors.input_rpm = 30000;
+    CRS_CURRENT_SETTINGS.pid_p_val_upshift = INT16_MAX;
+    CRS_CURRENT_SETTINGS.pid_i_val_upshift = INT16_MAX;
+    CRS_CURRENT_SETTINGS.pid_d_val_upshift = INT16_MAX;
+    const short saturated_correction = algo.calc_correction_trq(ShiftStyle::Crossover_Up, 0);
+    require(saturated_correction == INT16_MAX,
+            "PID sum is clamped to int16 before return and accumulation");
+
+    algo.pid_sum = 0;
+    algo.abs_sum = 0;
+    algo.pid_count = 0;
+    algo.momentum_pid[0] = 0;
+    algo.momentum_pid[1] = 0;
+    algo.target_turbine_speed = 0;
+    CRS_CURRENT_SETTINGS.pid_p_val_upshift = INT16_MIN;
+    CRS_CURRENT_SETTINGS.pid_i_val_upshift = INT16_MIN;
+    CRS_CURRENT_SETTINGS.pid_d_val_upshift = INT16_MIN;
+    const short saturated_negative_correction = algo.calc_correction_trq(ShiftStyle::Crossover_Up, 0);
+    require(saturated_negative_correction == INT16_MIN,
+            "negative PID sum is clamped to int16 before return and accumulation");
+
+    algo.pid_sum = INT32_MAX;
+    algo.abs_sum = 0;
+    algo.pid_count = 1;
+    algo.abs_input_trq = 0;
+    sensors.input_rpm = 1;
+    algo.target_turbine_speed = 0;
+    algo.momentum_pid[0] = 0;
+    algo.momentum_pid[1] = 0;
+    CRS_CURRENT_SETTINGS.pid_p_val_upshift = INT16_MAX;
+    CRS_CURRENT_SETTINGS.pid_i_val_upshift = 0;
+    CRS_CURRENT_SETTINGS.pid_d_val_upshift = 0;
+    algo.calc_correction_trq(ShiftStyle::Crossover_Up, 0);
+    require(algo.pid_sum == INT32_MAX && algo.abs_sum == 0 && algo.pid_count == 1,
+            "PID accumulator overflow sample is rejected without mutation");
+
+    algo.pid_sum = 0;
+    algo.abs_sum = INT32_MAX;
+    algo.pid_count = 1;
+    algo.abs_input_trq = 1;
+    algo.momentum_pid[0] = 0;
+    algo.momentum_pid[1] = 0;
+    algo.calc_correction_trq(ShiftStyle::Crossover_Up, 0);
+    require(algo.pid_sum == 0 && algo.abs_sum == INT32_MAX && algo.pid_count == 1,
+            "absolute torque accumulator overflow sample is rejected without mutation");
+}
+
+static void test_candidate_invalid_spc_domain() {
+    ShiftAdaptationSystem manager;
+    ShiftClutchData speeds{};
+    ShiftInterfaceData sid{};
+    sid.ptr_r_clutch_speeds = &speeds;
+    sid.adaptation_mgr = &manager;
+    sid.change = GearChange::_1_2;
+    sid.inf.map_idx = 0;
+    sid.inf.pressure_multi_spc_int = 0;
+    SensorData sensors{};
+    sensors.input_rpm = 3000;
+    PressureManager pm{};
+    pm.signed_pressure_result = 60;
+    TestShiftAlgo algo(&sid, &sensors, &pm);
+    algo.fill_time_adaptation_stage = 1;
+    algo.fill_pressure_adaptation_stage = 4;
+    algo.torque_adaptation_stage = 5;
+    algo.timer_p_adapt = 0xFC;
+    algo.adapting_turbine_spd = 3000;
+    algo.adaptation_step();
+    require(manager.spc_offset_map->data[0] == 0, "invalid SPC multiplier does not modify offset map");
+    cleanup(manager);
+}
+
+static void test_candidate_invalid_pressure_map_index() {
+    ShiftAdaptationSystem manager;
+    ShiftClutchData speeds{};
+    ShiftInterfaceData sid{};
+    sid.ptr_r_clutch_speeds = &speeds;
+    sid.adaptation_mgr = &manager;
+    sid.change = GearChange::_1_2;
+    sid.inf.map_idx = 8;
+    sid.inf.pressure_multi_spc_int = 1000;
+    SensorData sensors{};
+    sensors.input_rpm = 3000;
+    PressureManager pm{};
+    pm.signed_pressure_result = 60;
+    TestShiftAlgo algo(&sid, &sensors, &pm);
+    algo.fill_time_adaptation_stage = 1;
+    algo.fill_pressure_adaptation_stage = 4;
+    algo.torque_adaptation_stage = 5;
+    algo.timer_p_adapt = 0xFC;
+    algo.adapting_turbine_spd = 3000;
+    algo.adaptation_step();
+    require(pm.signed_pressure_calls == 0, "invalid gear map index skips inertia/policy array access");
+    require(manager.spc_offset_map->data[0] == 0, "invalid gear map index does not learn SPC offset");
+    cleanup(manager);
+}
+
+#ifdef SA12_CANDIDATE
+static void test_candidate_tcc_save_contract() {
+    int16_t defaults[TCC_SLIP_ADAPT_MAP_SIZE] = {};
+    StoredMap lock("tcc-lock", TCC_SLIP_ADAPT_MAP_SIZE, defaults, defaults,
+                   TCC_SLIP_ADAPT_MAP_SIZE, 1, defaults);
+    StoredMap slip("tcc-slip", TCC_SLIP_ADAPT_MAP_SIZE, defaults, defaults,
+                   TCC_SLIP_ADAPT_MAP_SIZE, 1, defaults);
+    TestTorqueConverterSave tcc{};
+    tcc.tcc_lock_map = &lock;
+    tcc.tcc_slip_map = &slip;
+    lock.save_result = 0x701;
+    require(tcc.save() == 0x701, "TCC save returns first lock-map failure");
+    require(lock.save_calls == 1 && slip.save_calls == 0, "TCC save stops after lock-map failure");
+    lock.save_calls = 0;
+    lock.save_result = ESP_OK;
+    slip.save_result = 0x702;
+    require(tcc.save() == 0x702, "TCC save returns slip-map failure");
+    require(lock.save_calls == 1 && slip.save_calls == 1, "TCC save retains lock then slip order");
+    slip.save_calls = 0;
+    tcc.tcc_slip_map = nullptr;
+    require(tcc.save() == ESP_ERR_INVALID_STATE, "TCC missing map returns invalid state before writes");
+    require(slip.save_calls == 0, "TCC missing map does not call any save method");
+}
+#endif
+
+static void test_baseline_oob() {
+    ShiftAdaptationSystem manager;
+    volatile int8_t value = manager.get_prefill_cycles_offset(8);
+    std::printf("{\"baseline_oob_read\":%d}\n", static_cast<int>(value));
+    cleanup(manager);
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "oob") == 0) {
+        test_baseline_oob();
+        return 0;
+    }
+
+    const auto normal = normal_map_path();
+    const bool learning_off_ok = learning_off_unchanged();
+    const uint64_t normal_pid_hash = normal_pid_regression(
+        @@NORMAL_INPUT_RPM_MAX@@, @@NORMAL_SLIP_MIN@@, @@NORMAL_SLIP_MAX@@);
+    const int avg_offset = average_torque_offset_result();
+    const int spc_positive = spc_positive_limit_result(100, 100, 60);
+    int prefill_high = 0;
+    int save_error_return = -1;
+    int save_error_calls = 0;
+
+    {
+        ShiftAdaptationSystem manager;
+#ifdef SA12_CANDIDATE
+        manager.init_shift();
+#endif
+        manager.prefill_time_map->data[0] = 200;
+        prefill_high = manager.get_prefill_cycles_offset(0);
+        for (StoredMap* map : {manager.prefill_time_map, manager.applying_torque_offset,
+                               manager.freeing_torque_offset, manager.spc_offset_map}) {
+            map->save_calls = 0;
+        }
+        manager.prefill_time_map->save_result = 0x711;
+        save_error_return = manager.save();
+        save_error_calls = manager.prefill_time_map->save_calls +
+                           manager.applying_torque_offset->save_calls +
+                           manager.freeing_torque_offset->save_calls +
+                           manager.spc_offset_map->save_calls;
+        cleanup(manager);
+    }
+
+    TestTorqueConverterSave tcc{};
+    int16_t defaults[TCC_SLIP_ADAPT_MAP_SIZE] = {};
+    StoredMap lock("tcc-lock", TCC_SLIP_ADAPT_MAP_SIZE, defaults, defaults,
+                   TCC_SLIP_ADAPT_MAP_SIZE, 1, defaults);
+    StoredMap slip("tcc-slip", TCC_SLIP_ADAPT_MAP_SIZE, defaults, defaults,
+                   TCC_SLIP_ADAPT_MAP_SIZE, 1, defaults);
+    tcc.tcc_lock_map = &lock;
+    tcc.tcc_slip_map = &slip;
+    lock.save_result = 0x721;
+#ifdef SA12_CANDIDATE
+    const int tcc_error_return = tcc.save();
+    require(tcc_error_return == 0x721 && lock.save_calls == 1 && slip.save_calls == 0,
+            "candidate TCC first-error return/stop");
+#else
+    tcc.save();
+    const int tcc_error_return = 0;
+    require(lock.save_calls == 1 && slip.save_calls == 1,
+            "SA11 negative control ignores lock-map error and continues");
+#endif
+
+#ifdef SA12_CANDIDATE
+    test_candidate_guards_and_saturation();
+    test_candidate_stored_map_reset_contract();
+    test_candidate_torque_accumulator_bound();
+    test_candidate_invalid_spc_domain();
+    test_candidate_invalid_pressure_map_index();
+    test_candidate_tcc_save_contract();
+    require(avg_offset == 9, "absolute torque average uses accumulated float mean");
+    require(spc_positive == 115, "SPC positive clamp compares against calculated limit");
+    require(prefill_high == INT8_MAX, "prefill getter saturates to int8 max");
+    require(save_error_return == 0x711 && save_error_calls == 1,
+            "shift save propagates first error and stops");
+    const char* mode = "sa12";
+#else
+    test_baseline_stored_map_reset_error_swallowed();
+    require(avg_offset == 10, "SA11 negative control reproduces current-sample/count integer division");
+    require(spc_positive == 200, "SA11 negative control reproduces incorrect positive limit jump");
+    require(prefill_high == static_cast<int8_t>(200), "SA11 negative control reproduces int8 narrowing");
+    require(save_error_return == ESP_OK && save_error_calls == 4,
+            "SA11 negative control reproduces ignored save errors");
+    const char* mode = "sa11-negative-control";
+#endif
+
+    std::printf(
+        "{\"mode\":\"%s\",\"normal_map_values\":[%d,%d,%d,%d],"
+        "\"learning_off_maps_unchanged\":%s,\"average_fixture_offset\":%d,"
+        "\"spc_positive_fixture\":%d,\"prefill_200_getter\":%d,"
+        "\"save_error_return\":%d,\"save_calls_before_stop\":%d,"
+        "\"tcc_save_error_return\":%d,\"tcc_lock_calls\":%d,\"tcc_slip_calls\":%d,"
+        "\"assertions\":%d,\"stored_map_reset_replace_failure\":\"%s\","
+        "\"normal_pid_regression_hash\":\"%016llx\",\"normal_pid_regression_cases\":%llu}\n",
+        mode, normal[0], normal[1], normal[2], normal[3],
+        learning_off_ok ? "true" : "false", avg_offset, spc_positive, prefill_high,
+        save_error_return, save_error_calls, tcc_error_return, lock.save_calls, slip.save_calls,
+        assertion_count,
+#ifdef SA12_CANDIDATE
+        "propagated"
+#else
+        "swallowed"
+#endif
+        , static_cast<unsigned long long>(normal_pid_hash),
+        static_cast<unsigned long long>(4ULL * @@NORMAL_INPUT_RPM_MAX@@ * 3ULL)
+    );
+    return 0;
+}

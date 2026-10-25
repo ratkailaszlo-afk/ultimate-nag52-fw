@@ -1,4 +1,5 @@
 #include "can_hal.h"
+#include "runtime_monitor.h"
 #include <stdio.h>
 #include "board_config.h"
 #include "esp_check.h"
@@ -128,18 +129,25 @@ void EgsBaseCan::task_loop() {
     uint64_t tmp;
     uint32_t now;
     while(true) {
+        RuntimeMonitor::Scope can_work(RuntimeMonitor::Stage::Can);
         now = GET_CLOCK_TIME();
         // Message Rx
         twai_get_status_info(&this->can_status);
         // Handle BUS OFF and BUS STOPPED
         if (this->can_status.state == twai_state_t::TWAI_STATE_BUS_OFF) {
+            RuntimeMonitor::fault(RuntimeMonitor::Counter::CanBusOff);
             twai_initiate_recovery();
         } else if (this->can_status.state == twai_state_t::TWAI_STATE_STOPPED) {
             twai_start();
         } else if (likely(this->can_status.state == twai_state_t::TWAI_STATE_RUNNING)) {
             uint8_t f_count  = can_status.msgs_to_rx;
             for(uint8_t x = 0; x < f_count; x++) { // Read all frames
-                if (twai_receive(&rx, pdMS_TO_TICKS(0)) == ESP_OK && rx.data_length_code != 0 && rx.flags == 0) {
+                const esp_err_t rx_status = twai_receive(&rx, pdMS_TO_TICKS(0));
+                if (rx_status != ESP_OK || rx.data_length_code == 0 || rx.data_length_code > sizeof(rx.data)) {
+                    RuntimeMonitor::fault(RuntimeMonitor::Counter::CanRxError);
+                }
+                if (rx_status == ESP_OK && rx.data_length_code != 0 && rx.data_length_code <= sizeof(rx.data) && rx.flags == 0) {
+                    RuntimeMonitor::source_complete(RuntimeMonitor::Source::CanDequeue, RuntimeMonitor::now_us());
                     if (CHECK_MODE_BIT_ENABLED(DEVICE_MODE_CANLOGGER)) {
                         // Logging mode
                         char buf[35];
@@ -211,6 +219,7 @@ void EgsBaseCan::task_loop() {
             }
         }
         this->on_rx_done(now);
+        can_work.finish();
         int taken = GET_CLOCK_TIME() - now;
         if (taken < this->tx_time_ms) {
             vTaskDelay((this->tx_time_ms - taken) / portTICK_PERIOD_MS); // Reset watchdog here
@@ -218,7 +227,7 @@ void EgsBaseCan::task_loop() {
     }
 }
 
-void EgsBaseCan::on_rx_done(const uint32_t now_ts)
+void EgsBaseCan::on_rx_done(const uint32_t)
 {
     if (nullptr != shifter) {
         switch (VEHICLE_CONFIG.shifter_style)
@@ -231,16 +240,19 @@ void EgsBaseCan::on_rx_done(const uint32_t now_ts)
                 // Override CAN information with external button
                 btn_pressed = pcb_gpio_matrix->is_program_switch_pressed();
             } else {
-                btn_pressed = get_profile_btn_press(now_ts);
+                btn_pressed = get_profile_btn_press(CanSignalExpiryMs::PROFILE_INPUT);
             }
-            shifterewm->set_program_button_pressed(btn_pressed, get_profile_switch_pos(now_ts));
+            shifterewm->set_program_button_pressed(
+                btn_pressed, get_profile_switch_pos(CanSignalExpiryMs::PROFILE_INPUT));
             break;
         }
         case (uint8_t)ShifterStyle::TRRS:
         {
             ShifterTrrs *shiftertrrs = reinterpret_cast<ShifterTrrs *>(shifter);
-            shiftertrrs->set_brake_is_pressed(get_is_brake_pressed(now_ts));
-            shiftertrrs->set_vehicle_speed(get_front_left_wheel(now_ts), get_front_right_wheel(now_ts));
+            shiftertrrs->set_brake_is_pressed(get_is_brake_pressed(CanSignalExpiryMs::TRRS_BRAKE));
+            shiftertrrs->set_vehicle_speed(
+                get_front_left_wheel(CanSignalExpiryMs::TRRS_WHEEL),
+                get_front_right_wheel(CanSignalExpiryMs::TRRS_WHEEL));
             break;
         }
         default:

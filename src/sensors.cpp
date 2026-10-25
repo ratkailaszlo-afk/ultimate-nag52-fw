@@ -1,4 +1,5 @@
 #include "sensors.h"
+#include "runtime_monitor.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
@@ -86,32 +87,55 @@ void Sensors::update(SensorDataRaw* dest) {
         dest->rpm_out = calc_rpm(&mem_data_out);
     }
     // Battery voltage gathering
-    int adc_res = 0;
-    int adc_voltage = 0;
-    if (ESP_OK == adc_oneshot_read(adc2_handle, pcb_gpio_matrix->sensor_data.adc_batt, &adc_res)) {
-        if (ESP_OK == adc_cali_raw_to_voltage(adc2_cal, adc_res, &adc_voltage)) {
+    int battery_raw = 0;
+    int battery_voltage_mv = 0;
+    if (ESP_OK == adc_oneshot_read(adc2_handle, pcb_gpio_matrix->sensor_data.adc_batt, &battery_raw)) {
+        if (ESP_OK == adc_cali_raw_to_voltage(adc2_cal, battery_raw, &battery_voltage_mv) &&
+            battery_voltage_mv > 0 && battery_voltage_mv <= 3300) {
             // Vin = Vout(R1+R2)/R2
-            adc_voltage *= 5.54; // 5.54 = (100+22)/22
-            dest->battery_mv = adc_voltage;
+            battery_voltage_mv *= 5.54; // 5.54 = (100+22)/22
+            if (battery_voltage_mv <= UINT16_MAX) {
+                dest->battery_mv = static_cast<uint16_t>(battery_voltage_mv);
+            }
         }
     }
 
     // TFT/PL lock
-    if (ESP_OK == adc_oneshot_read(adc2_handle, pcb_gpio_matrix->sensor_data.adc_atf, &adc_res)) {
-        if (adc_res > 3000) {
+    int atf_raw = 0;
+    if (ESP_OK == adc_oneshot_read(adc2_handle, pcb_gpio_matrix->sensor_data.adc_atf, &atf_raw) &&
+        atf_raw >= 0 && atf_raw <= 4095) {
+        if (atf_raw > 3000) {
             dest->parking_lock = 1;
             dest->atf_temp_c = INT_MAX;
         }
         else {
             dest->parking_lock = 0;
-            adc_cali_raw_to_voltage(adc2_cal, adc_res, &adc_voltage);
-
-            int resistance = (adc_voltage * pcb_gpio_matrix->sensor_data.atf_r2_resistance) / (3300 - adc_voltage);
-
-            float out_x10 = interpolate_linear_array((int16_t)resistance, NUM_TEMP_POINTS, TFT_RESISTANCE_TAB[0], TFT_RESISTANCE_TAB[1]);
-            dest->atf_temp_c = (int16_t)(out_x10 / 10.0);
+            int atf_voltage_mv = 0;
+            const int32_t r2 = pcb_gpio_matrix->sensor_data.atf_r2_resistance;
+            if (ESP_OK == adc_cali_raw_to_voltage(adc2_cal, atf_raw, &atf_voltage_mv) &&
+                atf_voltage_mv > 0 && atf_voltage_mv < 3300 && r2 > 0) {
+                const int32_t denominator = 3300 - atf_voltage_mv;
+                if (denominator > 0) {
+                    const int64_t resistance =
+                        (static_cast<int64_t>(atf_voltage_mv) * r2) / denominator;
+                    const int64_t resistance_min = TFT_RESISTANCE_TAB[0][0];
+                    const int64_t resistance_max = TFT_RESISTANCE_TAB[0][NUM_TEMP_POINTS - 1];
+                    if (resistance >= resistance_min && resistance <= resistance_max &&
+                        resistance <= INT16_MAX) {
+                        const float out_x10 = interpolate_linear_array(
+                            static_cast<int16_t>(resistance), NUM_TEMP_POINTS,
+                            TFT_RESISTANCE_TAB[0], TFT_RESISTANCE_TAB[1]);
+                        // Preserve the established integer conversion for valid samples.
+                        dest->atf_temp_c = static_cast<int16_t>(out_x10 / 10.0);
+                    }
+                }
+            }
         }
     }
+    if (dest->battery_mv == UINT16_MAX || dest->parking_lock == UINT8_MAX)
+        RuntimeMonitor::fault(RuntimeMonitor::Counter::SensorReadError);
+    if (dest->parking_lock == 0 && dest->atf_temp_c == INT_MAX)
+        RuntimeMonitor::fault(RuntimeMonitor::Counter::AtfCalibrationError);
 }
 
 esp_err_t configure_pcnt(const char* name, uint16_t pulses_per_rpm, gpio_num_t gpio, PcntMemData* mem) {

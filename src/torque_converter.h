@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <atomic>
+#include <esp_err.h>
 #include "canbus/can_hal.h"
 #include "common_structs.h"
 #include "nvs/eeprom_config.h"
@@ -12,6 +13,7 @@
 #include "canbus/can_hal.h"
 #include "nvs/module_settings.h"
 #include "tcc_trace.h"
+#include "adapt_maps.h"
 
 enum class InternalTccState {
     Open = 0,
@@ -38,14 +40,25 @@ class TorqueConverter {
         // Shift-thread flags remain owned by the shifting algorithm.
         void suspend(PressureManager* pm);
         TccClutchStatus get_clutch_state(void);
-        void save() {
-            if (this->tcc_lock_map) {
-                this->tcc_lock_map->save_to_eeprom();
+        esp_err_t save() {
+            const auto map_is_ready = [](StoredMap* map) {
+                return map != nullptr &&
+                       map->init_status() == ESP_OK &&
+                       map->get_map_element_count() == TCC_SLIP_ADAPT_MAP_SIZE &&
+                       map->data_size() == TCC_SLIP_ADAPT_MAP_SIZE &&
+                       map->is_allocated() &&
+                       map->get_map_name() != nullptr &&
+                       map->get_current_data() != nullptr;
+            };
+            if (!map_is_ready(this->tcc_lock_map) || !map_is_ready(this->tcc_slip_map)) {
+                return ESP_ERR_INVALID_STATE;
             }
-            if (this->tcc_slip_map) {
-                this->tcc_slip_map->save_to_eeprom();
+            esp_err_t err = this->tcc_lock_map->save_to_eeprom();
+            if (err != ESP_OK) {
+                return err;
             }
-        };
+            return this->tcc_slip_map->save_to_eeprom();
+        }
 
         void diag_toggle_tcc_sol(bool en);
         void trace_before(TccTraceRecord& r) const;

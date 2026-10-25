@@ -5,6 +5,7 @@
 #include "diag_data.h"
 #include "diag/uart_console.h"
 #include "tcc_trace.h"
+#include "runtime_monitor.h"
 #include "egs_emulation.h"
 #include "kwp_utils.h"
 #include "map_editor.h"
@@ -543,6 +544,14 @@ void Kwp2000_server::process_read_data_local_ident(uint8_t* args, uint16_t arg_l
             return;
         }
         make_diag_pos_msg(SID_READ_DATA_LOCAL_IDENT, RLI_TCC_CYCLE_TRACE, page, used);
+    } else if (args[0] == RLI_RUNTIME_MONITOR) {
+        uint8_t data[RuntimeMonitor::kWireSize] = {};
+        size_t used = 0;
+        if (!RuntimeMonitor::read(data, sizeof(data), &used)) {
+            make_diag_neg_msg(SID_READ_DATA_LOCAL_IDENT, NRC_REQUEST_OUT_OF_RANGE);
+            return;
+        }
+        make_diag_pos_msg(SID_READ_DATA_LOCAL_IDENT, RLI_RUNTIME_MONITOR, data, used);
     } else if (args[0] == RLI_MAP_EDITOR) {
         // 0 - RLI
         // 1 - Map ID
@@ -945,11 +954,14 @@ void Kwp2000_server::process_start_routine_by_local_ident(uint8_t* args, uint16_
                 make_diag_neg_msg(SID_START_ROUTINE_BY_LOCAL_IDENT, NRC_CONDITIONS_NOT_CORRECT_REQ_SEQ_ERROR);
             }
         } else if (args[0] == ROUTINE_ADAPTATION_RESET) {
-            esp_err_t res = this->gearbox_ptr->shift_adapter->reset();
+            esp_err_t res = ESP_ERR_INVALID_STATE;
+            if (this->gearbox_ptr && this->gearbox_ptr->shift_adapter)
+                res = this->gearbox_ptr->shift_adapter->reset();
             if (ESP_OK == res) {
                 make_diag_pos_msg(SID_START_ROUTINE_BY_LOCAL_IDENT, nullptr, 0);
             } else {
-                // Can only fail if adapt manager is nullptr (Not ready)
+                RuntimeMonitor::fault(RuntimeMonitor::Counter::AdaptationError);
+                // Invalid manager/map state or a map reset error is observable.
                 make_diag_neg_msg(SID_START_ROUTINE_BY_LOCAL_IDENT, NRC_CONDITIONS_NOT_CORRECT_REQ_SEQ_ERROR);
             }
         } else if (args[0] == ROUTINE_CALIBRATION_HOT_RELOAD) {

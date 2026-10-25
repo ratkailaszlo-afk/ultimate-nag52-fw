@@ -111,13 +111,14 @@ inline int16_t get_smoothed_sensor_val_signed(TCUIO::SmoothedSensor* src, uint8_
 } 
 
 esp_err_t TCUIO::setup_io_layer() {
-    // Setup PCB Sensor HAL
-    esp_err_t ret = ESP_OK;
     if (nullptr == egs_can_hal) {
-        ret = ESP_ERR_INVALID_STATE; 
-    } else {
-        // We have a CAN Layer, continue
-        Sensors::init_sensors();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Do not publish a usable I/O layer if its physical sensor HAL failed.
+    const esp_err_t sensor_status = Sensors::init_sensors();
+    if (ESP_OK != sensor_status) {
+        return sensor_status;
     }
     init_smoothed_sensor(&smoothed_sensor_n2_rpm, 3, 0);
     init_smoothed_sensor(&smoothed_sensor_n3_rpm, 3, 0);
@@ -140,7 +141,7 @@ esp_err_t TCUIO::setup_io_layer() {
     init_onepoll(&onepoll_motor_oil_temperature);
 
     DIFF_RATIO_F = (float)VEHICLE_CONFIG.diff_ratio / 1000.0;
-    return ret;
+    return ESP_OK;
 }
 
 void update_tft_sensor() {
