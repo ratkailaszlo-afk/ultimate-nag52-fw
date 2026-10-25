@@ -5,7 +5,7 @@
 #include "esp_err.h"
 #include "stored_table.h"
 
-class StoredMap : public LookupAllocMap, public StoredData {
+class StoredMap final : public LookupAllocMap, public StoredData {
 
     public:
         StoredMap(

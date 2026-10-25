@@ -2,6 +2,7 @@
 #define TORQUE_CONVERTER_H__
 
 #include <stdint.h>
+#include <atomic>
 #include "canbus/can_hal.h"
 #include "common_structs.h"
 #include "nvs/eeprom_config.h"
@@ -84,6 +85,8 @@ class TorqueConverter {
         }
 
     private:
+        // bit0 Open, bit1 Slipping: selected CAN request before reaction flags.
+        std::atomic<uint8_t> can_request_bits{0};
         // Multiplied by 100!
         int tcc_slip_filtered = 0;
         int rated_max_torque;

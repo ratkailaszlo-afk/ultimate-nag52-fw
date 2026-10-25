@@ -30,17 +30,20 @@ TorqueConverter::TorqueConverter(uint16_t max_gb_rating)  {
     const int16_t adapt_map_y_headers[5] = {1,2,3,4,5}; // Gear
     this->tcc_slip_map = new StoredMap(NVS_KEY_TCC_ADAPT_SLIP_MAP, TCC_SLIP_ADAPT_MAP_SIZE, adapt_map_x_headers, adapt_map_y_headers, LOAD_SIZE, 5, TCC_SLIP_ADAPT_MAP);
     if (this->tcc_slip_map->init_status() != ESP_OK) {
-        delete[] this->tcc_slip_map;
+        delete this->tcc_slip_map;
+        this->tcc_slip_map = nullptr;
     }
 
     this->tcc_lock_map = new StoredMap(NVS_KEY_TCC_ADAPT_LOCK_MAP, TCC_SLIP_ADAPT_MAP_SIZE, adapt_map_x_headers, adapt_map_y_headers, LOAD_SIZE, 5, TCC_LOCK_ADAPT_MAP);
     if (this->tcc_lock_map->init_status() != ESP_OK) {
-        delete[] this->tcc_lock_map;
+        delete this->tcc_lock_map;
+        this->tcc_lock_map = nullptr;
     }
 
     this->slip_rpm_target_map = new StoredMap(NVS_KEY_TCC_SLIP_TARGET_MAP, TCC_RPM_TARGET_MAP_SIZE, rpm_map_x_headers, rpm_map_y_headers, 11, 8, TCC_RPM_TARGET_MAP);
     if (this->slip_rpm_target_map->init_status() != ESP_OK) {
-        delete[] this->slip_rpm_target_map;
+        delete this->slip_rpm_target_map;
+        this->slip_rpm_target_map = nullptr;
     }
 
     this->init_tables_ok = (this->tcc_slip_map != nullptr) && (this->tcc_lock_map != nullptr) && (this->slip_rpm_target_map != nullptr);
@@ -86,6 +89,14 @@ int16_t get_cell_value(int16_t* dest, GearboxGear gear, uint8_t load_idx) {
 
 
 void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, PressureManager* pm, AbstractProfile* profile, SensorData* sensors) {
+    // Selected CAN request before reaction flags; snapshot also updates on disable paths.
+    const TccReqState engine_req_state = (egs_can_hal != nullptr)
+        ? egs_can_hal->get_engine_tcc_override_request(500) : TccReqState::None;
+    this->can_request_bits.store(
+        engine_req_state == TccReqState::Open ? 0x01 :
+        engine_req_state == TccReqState::Slipping ? 0x02 : 0x00,
+        std::memory_order_relaxed);
+
     int slip_now = abs((int32_t)sensors->engine_rpm-(int32_t)sensors->input_rpm);
     int motor_torque = sensors->converted_torque;
     int load_as_percent = abs(((int)motor_torque*100) / this->rated_max_torque);
@@ -199,7 +210,6 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
         }
     }
 
-    TccReqState engine_req_state = egs_can_hal->get_engine_tcc_override_request(500);
     if (TccReqState::None != engine_req_state) {
         // Engine is requesting at most to slip the converter
         if (TCC_CURRENT_SETTINGS.react_on_engine_slip_request && engine_req_state == TccReqState::Slipping && targ > InternalTccState::Slipping) {
@@ -207,7 +217,7 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
             slipping_rpm_targ = MAX(this->slip_target, 50);
         } 
         // Engine is requesting full TCC open
-        else if (TCC_CURRENT_SETTINGS.react_on_engine_open_request) {
+        else if (TCC_CURRENT_SETTINGS.react_on_engine_open_request && engine_req_state == TccReqState::Open) {
             targ = InternalTccState::Open;
             slipping_rpm_targ = SLIP_V_WHEN_OPEN;
         }
@@ -405,7 +415,7 @@ uint8_t TorqueConverter::get_target_state() {
 }
 
 uint8_t TorqueConverter::get_can_req_bits() {
-    return  0;
+    return this->can_request_bits.load(std::memory_order_relaxed);
 }
 
 uint16_t TorqueConverter::get_current_pressure() {

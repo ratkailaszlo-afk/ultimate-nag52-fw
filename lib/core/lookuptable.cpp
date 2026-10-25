@@ -80,6 +80,7 @@ LookupAllocTable::LookupAllocTable(const int16_t *_xHeader, const uint16_t _xHea
 LookupAllocTable::~LookupAllocTable()
 {
     TCU_FREE(data);
+    delete static_cast<LookupAllocHeader*>(this->xHeader);
 }
 
 bool LookupAllocTable::add_data(const int16_t* map, const uint16_t size) {

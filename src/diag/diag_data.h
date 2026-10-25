@@ -146,8 +146,9 @@ typedef struct {
     // 2 - Closed
     uint8_t targ_state;
     uint8_t current_state;
-    // 0b1 - Open request 
-    // 0b01 - Slip request
+    // bit0 (0x01): selected CAN Open request before reaction flags.
+    // bit1 (0x02): selected CAN Slipping request before reaction flags.
+    // 0 also covers expired/missing/unsupported CAN; not a validity indication.
     uint8_t can_request_bits;
     //
     uint32_t engine_output_joule;

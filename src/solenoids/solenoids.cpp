@@ -39,7 +39,7 @@ each channel:
 uint8_t adc_read_buf[I2S_DMA_BUF_LEN];
 bool first_read_complete = false;
 uint64_t isr_done = 0;
-uint8_t CHANNEL_ID_MAP[ADC_CHANNEL_9] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+uint8_t CHANNEL_ID_MAP[16] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
 void read_solenoids_i2s(void*) {
     PwmSolenoid* const sol_order[6] = { sol_mpc, sol_spc, sol_y3, sol_y4, sol_y5, sol_tcc };
@@ -55,7 +55,7 @@ void read_solenoids_i2s(void*) {
         adc_pattern[i].channel = sol_order[i]->get_adc_channel() & 0x7;
         adc_pattern[i].unit = ADC_UNIT_1;
         adc_pattern[i].bit_width = SOC_ADC_DIGI_MAX_BITWIDTH; // 12bits
-        CHANNEL_ID_MAP[(uint8_t)sol_order[i]->get_adc_channel()] = i;
+        CHANNEL_ID_MAP[(uint8_t)sol_order[i]->get_adc_channel() & 0xF] = i;
     }
     adc_continuous_config_t dig_cfg = {
         .pattern_num = 6,

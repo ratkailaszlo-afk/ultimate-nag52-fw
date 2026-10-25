@@ -104,7 +104,7 @@ DATA_TCC_PROGRAM get_tcc_program_data(Gearbox* gb_ptr) {
     ret.slip_target = gb_ptr->tcc->get_slip_targ();
     ret.targ_state = gb_ptr->tcc->get_target_state();
     ret.current_state = gb_ptr->tcc->get_current_state();
-    ret.can_request_bits = 0; // TODO
+    ret.can_request_bits = gb_ptr->tcc->get_can_req_bits();
     ret.tcc_absorbed_joule = gb_ptr->tcc->get_absorbed_power();
     ret.engine_output_joule = gb_ptr->tcc->get_engine_power();
     ret.load_percent = gb_ptr->tcc->get_engine_load_percent();

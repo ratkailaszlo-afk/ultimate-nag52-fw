@@ -105,8 +105,8 @@ LookupAllocMap::LookupAllocMap(const int16_t* _xHeader, const uint16_t _xHeaderS
 }
 
 LookupAllocMap::~LookupAllocMap() {
-    delete this->yHeader;
-    delete this->table;
+    delete static_cast<LookupAllocHeader*>(this->yHeader);
+    delete static_cast<LookupAllocTable*>(this->table);
 }
 
 bool LookupAllocMap::add_data(const int16_t* map, const uint16_t size) {
@@ -160,8 +160,8 @@ bool LookupByteMap::add_data(const uint8_t* map, const uint16_t size) {
 }
 
 LookupByteMap::~LookupByteMap() {
-    delete this->table;
-    delete this->yHeader;
+    delete static_cast<LookupAllocTable*>(this->table);
+    delete static_cast<LookupAllocHeader*>(this->yHeader);
     TCU_FREE(this->x_alloc);
     TCU_FREE(this->y_alloc);
     TCU_FREE(this->z_alloc);

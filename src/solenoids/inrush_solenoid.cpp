@@ -122,46 +122,88 @@ bool zener_on = false;
 uint32_t total  = 0;
 bool pwm_en = false;
 uint32_t IRAM_ATTR InrushControlSolenoid::on_timer_interrupt_new() {
-    // Control the zener phase
-    int ret = TOTAL_PERIOD_TIME_US;
-    if (this->inrush_time != 0 || this->hold_time != 0) {
-        if (this->phase_id == 0) { // Off -> Inrush
-            pwm_on = true;
+    uint32_t ret = TOTAL_PERIOD_TIME_US;
+    bool interval_ready = false;
+    // Skip zero-length phases in this ISR instead of rearming at the same tick.
+    // At most three phase transitions are possible before a positive interval.
+    for (uint8_t transitions = 0; transitions < 4; ++transitions) {
+        if (this->inrush_time == 0 && this->hold_time == 0) {
             zener_on = false;
-            ret = this->inrush_time;
+            pwm_on = false;
+            this->phase_id = 0;
+            interval_ready = true;
+            break;
+        }
+        if (this->phase_id == 0) { // Off -> Inrush
             if (this->hold_time != 0) {
-                this->phase_id = 1; // Inrush -> hold
+                this->phase_id = 1;
                 pwm_en = false;
                 total = 0;
             } else {
-                this->phase_id = 2; // Inrush -> off (No hold)
+                this->phase_id = 2;
             }
+            if (this->inrush_time == 0) {
+                continue;
+            }
+            pwm_on = true;
+            zener_on = false;
+            ret = this->inrush_time;
+            interval_ready = true;
+            break;
         } else if (this->phase_id == 1) { // Inrush -> Hold
+            const uint32_t remaining = total < this->hold_time ? this->hold_time - total : 0;
+            if (remaining == 0) {
+                if (this->off_time == 0 && this->hold_time != 0) {
+                    total = 0;
+                } else {
+                    this->phase_id = 2;
+                }
+                continue;
+            }
             zener_on = false;
             pwm_on = pwm_en;
             pwm_en = !pwm_en;
-            // Phase on/off for pwm
-
-            ret = MIN(!pwm_en ? this->pwm_on_time : this->pwm_off_time, total - this->hold_time);
-            if (total+ret >= this->hold_time) {
+            uint32_t span = !pwm_en ? this->pwm_on_time : this->pwm_off_time;
+            if (span == 0) {
+                // A zero PWM subphase needs no alarm; advance to its partner.
+                pwm_on = pwm_en;
+                pwm_en = !pwm_en;
+                span = !pwm_en ? this->pwm_on_time : this->pwm_off_time;
+            }
+            if (span == 0) {
+                // PWM timing is not initialized yet: hold off until the next phase.
+                pwm_on = false;
+                span = remaining;
+            }
+            ret = MIN(span, remaining);
+            total += ret;
+            if (total >= this->hold_time) {
                 if (this->off_time == 0) {
-                    // We go back to this phase (Constant hold)
                     total = 0;
                 } else {
-                    this->phase_id = 2; // Done, turn off!
+                    this->phase_id = 2;
                 }
             }
-            total += ret;
+            interval_ready = true;
+            break;
         } else { // Hold -> Off
+            this->phase_id = 0;
+            if (this->off_time == 0) {
+                continue;
+            }
             zener_on = true;
             pwm_on = false;
-            this->phase_id = 0;
             ret = this->off_time;
+            interval_ready = true;
+            break;
         }
-    } else {
-        zener_on = false;
+    }
+    if (!interval_ready) {
+        // Concurrent timing changes must not leave a stale ON interval on exhaustion.
         pwm_on = false;
-        this->phase_id = 0; // Off
+        zener_on = false;
+        this->phase_id = 0;
+        ret = TOTAL_PERIOD_TIME_US;
     }
     volatile uint32_t* reg_pwm = pwm_on ? &GPIO.out_w1ts : &GPIO.out_w1tc;
     volatile uint32_t* reg_zen = zener_on ? &GPIO.out_w1ts : &GPIO.out_w1tc;
