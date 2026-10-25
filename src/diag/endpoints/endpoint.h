@@ -63,6 +63,7 @@ private:
     char *write_buffer;
     SemaphoreHandle_t write_mutex;
     uint16_t read_pos;
+    uint32_t last_rx_byte_ms = 0;
     bool clear_to_send = false;
     int data_size;
     int line_idx;

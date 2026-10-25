@@ -122,14 +122,16 @@ esp_err_t EEPROM::set_device_mode(uint16_t mode) {
 esp_err_t EEPROM::init_eeprom() {
     // Called on startup
     esp_err_t result = nvs_flash_init();
-    if (result == ESP_ERR_NVS_NO_FREE_PAGES || result == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    if (result != ESP_OK) {
         ESP_LOG_LEVEL(ESP_LOG_ERROR, "EEPROM", "EEPROM init failed! %s", esp_err_to_name(result));
+        return result;
     } else {
         // Flash init OK
         nvs_handle_t config_handle;    
         result = nvs_open(NVS_PARTITION_USER_CFG, NVS_READWRITE, &config_handle);
         if (result != ESP_OK) {
             ESP_LOG_LEVEL(ESP_LOG_ERROR, "EEPROM", "EEPROM NVS handle failed! %s", esp_err_to_name(result));
+            return result;
         }
         MAP_NVS_HANDLE = config_handle;
         bool new_fw = false;
@@ -194,10 +196,17 @@ esp_err_t EEPROM::init_eeprom() {
 }
 
 esp_err_t EEPROM::read_core_config(TCM_CORE_CONFIG* dest) {
-    nvs_handle_t handle;
-    nvs_open(NVS_PARTITION_USER_CFG, NVS_READWRITE, &handle); // Must succeed as we have already opened it!
+    if (dest == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t handle = 0;
+    esp_err_t result = nvs_open(NVS_PARTITION_USER_CFG, NVS_READWRITE, &handle);
+    if (result != ESP_OK) {
+        return result;
+    }
     size_t s = sizeof(TCM_CORE_CONFIG);
-    esp_err_t result = nvs_get_blob(handle, NVS_KEY_CORE_SCN, dest, &s);
+    TCM_CORE_CONFIG loaded = {};
+    result = nvs_get_blob(handle, NVS_KEY_CORE_SCN, &loaded, &s);
     if (result == ESP_ERR_NVS_NOT_FOUND) {
         ESP_LOG_LEVEL(ESP_LOG_WARN, "EEPROM", "SCN Config not found. Creating a new one");
         TCM_CORE_CONFIG c = {
@@ -232,11 +241,17 @@ esp_err_t EEPROM::read_core_config(TCM_CORE_CONFIG* dest) {
                 ESP_LOG_LEVEL(ESP_LOG_ERROR, "EEPROM", "Error calling nvs_commit: %s", esp_err_to_name(result));
             } else {
                 ESP_LOG_LEVEL(ESP_LOG_INFO, "EEPROM", "New SCN  creation OK!");
-                memcpy(dest, &s, sizeof(s));
+                memcpy(dest, &c, sizeof(c));
                 result = ESP_OK;
             }
         }
-        return true;
+        return result;
+    }
+    if (result == ESP_OK) {
+        if (s != sizeof(TCM_CORE_CONFIG)) {
+            return ESP_ERR_NVS_INVALID_LENGTH;
+        }
+        memcpy(dest, &loaded, sizeof(loaded));
     }
     return result;
 }
