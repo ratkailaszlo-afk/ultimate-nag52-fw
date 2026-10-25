@@ -35,7 +35,9 @@ class TorqueConverter {
          * @param sensors Sensor data used as input
          * @param shifting True if the car is currently transitioning to new gear
          */
-        void update(GearboxGear curr_gear, GearboxGear targ_gear, PressureManager* pm, AbstractProfile* profile, SensorData* sensors);
+        // Optional same-pass gearbox gate; callers without fresh context retain
+        // the previous policy. No diagnostic or persisted configuration ABI change.
+        void update(GearboxGear curr_gear, GearboxGear targ_gear, PressureManager* pm, AbstractProfile* profile, SensorData* sensors, bool s_city_third_coast = false);
         // Force the converter control open when the gearbox cannot run update().
         // Shift-thread flags remain owned by the shifting algorithm.
         void suspend(PressureManager* pm);

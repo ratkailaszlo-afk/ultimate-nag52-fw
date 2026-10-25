@@ -113,7 +113,7 @@ void TorqueConverter::suspend(PressureManager* pm) {
     // is_shifting / upshifting / release_shifting belong to the shift thread.
 }
 
-void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, PressureManager* pm, AbstractProfile* profile, SensorData* sensors) {
+void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, PressureManager* pm, AbstractProfile* profile, SensorData* sensors, bool s_city_third_coast) {
     this->trace_prefill_taken = false;
     // Selected CAN request before reaction flags; snapshot also updates on disable paths.
     const TccReqState engine_req_state = (egs_can_hal != nullptr)
@@ -246,6 +246,17 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
             targ = InternalTccState::Open;
             slipping_rpm_targ = SLIP_V_WHEN_OPEN;
         }
+    }
+    // Stable third-gear lift in city S: a fresh gearbox-level gate is required.
+    // Recheck local context before selecting the existing Open command path.
+    // This changes the requested state, not just pressure under a Closed label.
+    // Reapplication keeps the existing prefill logic and must be road-verified.
+    if (s_city_third_coast && profile != nullptr &&
+        profile->get_profile() == GearboxProfile::Standard &&
+        curr_gear == GearboxGear::Third && targ_gear == GearboxGear::Third &&
+        !is_shifting && sensors->pedal_pos == 0 && !sensors->brake_pressed) {
+        targ = InternalTccState::Open;
+        slipping_rpm_targ = SLIP_V_WHEN_OPEN;
     }
     // Variable set
     this->target_tcc_state = targ;

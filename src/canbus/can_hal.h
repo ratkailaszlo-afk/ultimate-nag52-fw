@@ -240,6 +240,12 @@ class EgsBaseCan {
             return false;
         }
 
+        // Explicit, fresh release evidence for the optional city coast policy.
+        // Unsupported backends retain the previous TCC strategy.
+        virtual bool get_brake_released_for_coast(const uint32_t expire_time_ms) {
+            return false;
+        }
+
         /**
          * @brief OPTIONAL DATA - Returns fuel consumption rate of the engine
          * 

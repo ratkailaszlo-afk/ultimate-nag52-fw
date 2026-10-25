@@ -1,5 +1,6 @@
 #include "gearbox.h"
 #include "tcc_trace.h"
+#include "s_city_tcc_coast.h"
 #include "runtime_monitor.h"
 #include "runtime_signal_policy.h"
 #include "esp_timer.h"
@@ -1305,7 +1306,31 @@ void Gearbox::controller_loop()
                 this->tcc->trace_before(cycle_trace);
                 {
                     RuntimeMonitor::Scope tcc_time(RuntimeMonitor::Stage::Tcc);
-                    this->tcc->update(this->actual_gear, this->target_gear, this->pressure_mgr, tcc_profile, &this->sensor_data);
+                    const bool fresh_brake_released = coast_pedal == 0 &&
+                        tcc_profile != nullptr && tcc_profile->get_profile() == GearboxProfile::Standard &&
+                        this->actual_gear == GearboxGear::Third && this->target_gear == GearboxGear::Third &&
+                        !this->shifting && egs_can_hal->get_brake_released_for_coast(
+                            SCityTccCoast::BRAKE_RELEASE_EXPIRY_MS);
+                    const SCityTccCoast::Context third_coast_context{
+                        .standard_profile = tcc_profile != nullptr &&
+                            tcc_profile->get_profile() == GearboxProfile::Standard,
+                        .stable_third = this->actual_gear == GearboxGear::Third &&
+                            this->target_gear == GearboxGear::Third,
+                        .gearbox_shifting = this->shifting,
+                        .ratio_agrees = gear_disagree_count == 0 && SCityTccCoast::ratio_is_third(
+                            this->sensor_data.input_rpm, this->sensor_data.output_rpm,
+                            this->gearboxConfig.bounds[2].ratio_min_drift,
+                            this->gearboxConfig.bounds[2].ratio_max_drift),
+                        .forward_signals_valid = forward_control_valid,
+                        .raw_speeds_valid = coast_raw_speeds_valid,
+                        .safe_engine_rpm = coast_engine_valid,
+                        .brake_released_valid = fresh_brake_released,
+                        .brake_pressed = this->sensor_data.brake_pressed,
+                        .raw_pedal = coast_pedal,
+                        .cached_pedal = this->sensor_data.pedal_pos,
+                    };
+                    this->tcc->update(this->actual_gear, this->target_gear, this->pressure_mgr,
+                        tcc_profile, &this->sensor_data, SCityTccCoast::allow(third_coast_context));
                 }
                 this->tcc->trace_after(cycle_trace);
                 egs_can_hal->set_clutch_status(this->tcc->get_clutch_state());

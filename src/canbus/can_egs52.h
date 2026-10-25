@@ -54,6 +54,7 @@ class Egs52Can: public EgsBaseCan {
          bool get_profile_btn_press(const uint32_t expire_time_ms) override;
         // 
         bool get_is_brake_pressed(const uint32_t expire_time_ms) override;
+        bool get_brake_released_for_coast(const uint32_t expire_time_ms) override;
         // TerminalStatus get_terminal_15(const uint32_t expire_time_ms) override;
         uint16_t get_fuel_flow_rate(const uint32_t expire_time_ms) override;
         TransferCaseState get_transfer_case_state(const uint32_t expire_time_ms) override;

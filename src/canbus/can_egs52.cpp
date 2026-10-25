@@ -311,6 +311,19 @@ bool Egs52Can::get_is_brake_pressed(const uint32_t expire_time_ms) {
     }
 }
 
+bool Egs52Can::get_brake_released_for_coast(const uint32_t expire_time_ms) {
+    const uint32_t now = GET_CLOCK_TIME();
+    // Generated cache timestamps start at zero without a seen bitmap. During
+    // the first expiry window even an unseen zero frame could look fresh.
+    // Fail closed for that entire startup window, including real fresh frames.
+    if (now < expire_time_ms) {
+        return false;
+    }
+    BS_200_EGS52 bs200;
+    return this->esp_ecu.get_BS_200(now, expire_time_ms, &bs200) &&
+        bs200.BLS == BS_200h_BLS_EGS52::BREMSE_NBET;
+}
+
 bool Egs52Can::get_profile_btn_press(const uint32_t expire_time_ms) {
 	bool result = false;
 	EWM_230_EGS52 ewm;
