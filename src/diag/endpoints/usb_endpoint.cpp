@@ -1,4 +1,5 @@
 #include "endpoint.h"
+#include "diag/uart_console.h"
 
 const static char HEX_DEF[17] = "0123456789ABCDEF";
 const static size_t UART_MSG_SIZE = 6 + (2 * DIAG_CAN_MAX_SIZE);
@@ -6,6 +7,9 @@ const uart_port_t UART_PORT = uart_port_t::UART_NUM_0;
 
 UsbEndpoint::UsbEndpoint() : AbstractEndpoint()
 {
+    this->read_buffer = nullptr;
+    this->write_buffer = nullptr;
+    this->write_mutex = nullptr;
     data_size = 0;
     line_idx = 0;
     max_bytes_left = 0;
@@ -14,13 +18,32 @@ UsbEndpoint::UsbEndpoint() : AbstractEndpoint()
     this->status = uart_driver_install(UART_PORT, 512, 512, 0, nullptr, 0);
     if (this->status == ESP_OK)
     {
-        this->read_buffer = static_cast<char *>(malloc(UART_MSG_SIZE));
-        this->write_buffer = static_cast<char *>(malloc(UART_MSG_SIZE));
-        if (nullptr != this->read_buffer && nullptr != this->write_buffer)
+        // Driver-backed stdio shares the UART driver's TX lock. The log
+        // callback itself never writes here; queued records drain separately.
+        UartConsole::configure_vfs_driver();
+        this->write_mutex = xSemaphoreCreateMutex();
+        if (this->write_mutex != nullptr)
         {
-            uart_flush(UART_PORT);
-            this->read_pos = 0;
-        } else {
+            this->read_buffer = static_cast<char *>(malloc(UART_MSG_SIZE));
+            this->write_buffer = static_cast<char *>(malloc(UART_MSG_SIZE));
+            if (nullptr != this->read_buffer && nullptr != this->write_buffer)
+            {
+                this->status = uart_flush(UART_PORT);
+                if (this->status == ESP_OK)
+                {
+                    this->read_pos = 0;
+                    UartConsole::mark_transport_ready();
+                }
+            } else {
+                free(this->read_buffer);
+                free(this->write_buffer);
+                this->read_buffer = nullptr;
+                this->write_buffer = nullptr;
+                this->status = ESP_ERR_NO_MEM;
+            }
+        }
+        else
+        {
             this->status = ESP_ERR_NO_MEM;
         }
     }
@@ -32,6 +55,16 @@ esp_err_t UsbEndpoint::init_state() {
 
 void UsbEndpoint::send_data(uint32_t id, uint8_t *buf, uint16_t len)
 {
+    if (this->status != ESP_OK || this->write_buffer == nullptr || this->write_mutex == nullptr ||
+        len > DIAG_CAN_MAX_SIZE || (len != 0 && buf == nullptr))
+    {
+        return;
+    }
+    if (xSemaphoreTake(this->write_mutex, portMAX_DELAY) != pdTRUE)
+    {
+        return;
+    }
+
     this->write_buffer[0] = '#';
     this->write_buffer[1] = HEX_DEF[(id >> 12) & 0x0F];
     this->write_buffer[2] = HEX_DEF[(id >> 8) & 0x0F];
@@ -44,6 +77,7 @@ void UsbEndpoint::send_data(uint32_t id, uint8_t *buf, uint16_t len)
     }
     this->write_buffer[(len * 2) + 5] = '\n';
     uart_write_bytes(UART_PORT, &this->write_buffer[0], (len * 2) + 6);
+    xSemaphoreGive(this->write_mutex);
 }
 
 bool UsbEndpoint::read_data(DiagMessage *dest)

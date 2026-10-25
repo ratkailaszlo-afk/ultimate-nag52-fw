@@ -88,6 +88,31 @@ int16_t get_cell_value(int16_t* dest, GearboxGear gear, uint8_t load_idx) {
 }
 
 
+void TorqueConverter::suspend(PressureManager* pm) {
+    // The gearbox may force the electrical target off without calling update().
+    // Drop the matching internal model so re-entry gets a fresh prefill decision.
+    this->tcc_commanded_pressure = 0;
+    this->tcc_actual_pressure = 0;
+    this->current_tcc_state = InternalTccState::Open;
+    this->target_tcc_state = InternalTccState::Open;
+    this->slip_target = SLIP_V_WHEN_OPEN;
+    this->tcc_slip_filtered = 0;
+    this->prefill_start_time = 0;
+    this->prefill_done = false;
+    this->prefill_running = false;
+    this->prefill_cycles = 0;
+    this->trace_prefill_taken = false;
+    this->trace_command_before_atf = 0;
+    this->can_request_bits.store(0, std::memory_order_relaxed);
+    this->engine_load_percent = 0;
+    this->engine_output_joule = 0;
+    this->absorbed_power_joule = 0;
+    if (pm != nullptr) {
+        pm->set_target_tcc_pressure(0);
+    }
+    // is_shifting / upshifting / release_shifting belong to the shift thread.
+}
+
 void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, PressureManager* pm, AbstractProfile* profile, SensorData* sensors) {
     this->trace_prefill_taken = false;
     // Selected CAN request before reaction flags; snapshot also updates on disable paths.
@@ -120,14 +145,11 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
         !this->tcc_solenoid_enabled || // Diagnostic request
         !init_tables_ok // Some data was not initialized or invalid
     ) {
-        this->tcc_commanded_pressure = 0;
-        this->trace_command_before_atf = 0;
-        pm->set_target_tcc_pressure(this->tcc_commanded_pressure);
-        this->current_tcc_state = InternalTccState::Open;
-        this->target_tcc_state = InternalTccState::Open;
-        this->slip_target = SLIP_V_WHEN_OPEN;
-        this->prefill_done = false;
-        this->prefill_running = false;
+        // Keep the CAN diagnostic snapshot taken at the start of this update,
+        // while clearing the internal model and prefill lifecycle completely.
+        const uint8_t selected_request = this->can_request_bits.load(std::memory_order_relaxed);
+        this->suspend(pm);
+        this->can_request_bits.store(selected_request, std::memory_order_relaxed);
         return;
     }
 
@@ -279,14 +301,25 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
             load_cell = 12;
         }
     }
+    // The low model-pressure check admits prefill and also ends an existing
+    // burst early. Complete it explicitly instead of leaving a live counter
+    // behind; do not extend the existing 10000 mbar pulse to its full cap.
+    const bool prefill_pressure_low = this->tcc_actual_pressure/100 < 100;
+    const bool increasing_state = this->target_tcc_state > this->current_tcc_state;
+    if (prefill_running && !prefill_done && (!prefill_pressure_low || !increasing_state)) {
+        prefill_running = false;
+        prefill_done = true;
+        prefill_cycles = 0;
+    }
     // Prefilling when suddenly increasing state requested
-    if (this->target_tcc_state > this->current_tcc_state && this->tcc_actual_pressure/100 < 100 && !prefill_done) {
+    if (increasing_state && prefill_pressure_low && !prefill_done) {
         // Prefill logic
         this->trace_prefill_taken = true;
         if (false == prefill_running) {
             // Var setup (Start of prefill)
             prefill_running = true;
-            prefill_cycles = TCC_CURRENT_SETTINGS.prefill_cycles*3;
+            // The trace ABI exposes an 8-bit counter; saturate before narrowing.
+            prefill_cycles = MIN(uint16_t(TCC_CURRENT_SETTINGS.prefill_cycles) * 3u, UINT8_MAX);
         }
 
         if (prefill_cycles > 0) {
@@ -294,6 +327,8 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
         }
         if (prefill_cycles == 0 || slip_now <= this->slip_target) {
             prefill_done = true;
+            prefill_running = false;
+            prefill_cycles = 0;
         }
         this->tcc_commanded_pressure = TCC_CURRENT_SETTINGS.prefill_pressure;
     } else {
@@ -347,21 +382,23 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
         was_shifting = false;
     }
 
-    // Pressure achieved.
-    if (abs(this->tcc_commanded_pressure-this->tcc_actual_pressure/100) < 1) {
-        this->current_tcc_state = this->target_tcc_state;
-    }
-    // Reset prefill info when we go to 0 pressure
-    if (this->tcc_commanded_pressure == 0) {
-        this->prefill_done = false;
-        this->prefill_running = false;
-    }
     this->trace_command_before_atf = this->tcc_commanded_pressure;
     // OEM EGS - Below 60C, TCC pressure is reduced by a factor based on
-    // ATF temperature
+    // ATF temperature. Compare state against the same final mbar command
+    // that the pressure model follows on the next update.
     if (sensors->atf_temp < TCC_CURRENT_SETTINGS.tcc_temp_multiplier.raw_max) {
         float mul = interpolate_float(sensors->atf_temp, &TCC_CURRENT_SETTINGS.tcc_temp_multiplier, InterpType::Linear);
         this->tcc_commanded_pressure = (float)this->tcc_commanded_pressure*mul;
+    }
+    // Pressure achieved in the internal filtered model (not measured pressure).
+    if (abs(this->tcc_commanded_pressure-this->tcc_actual_pressure/100) < 1) {
+        this->current_tcc_state = this->target_tcc_state;
+    }
+    // Reset prefill info when the final electrical request goes to zero.
+    if (this->tcc_commanded_pressure == 0) {
+        this->prefill_done = false;
+        this->prefill_running = false;
+        this->prefill_cycles = 0;
     }
     pm->set_target_tcc_pressure(this->tcc_commanded_pressure);
 }

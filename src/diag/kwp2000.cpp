@@ -3,6 +3,7 @@
 #include <string>
 #include <time.h>
 #include "diag_data.h"
+#include "diag/uart_console.h"
 #include "tcc_trace.h"
 #include "egs_emulation.h"
 #include "kwp_utils.h"
@@ -333,6 +334,7 @@ void Kwp2000_server::server_loop() {
             }
             this->send_resp = false;
         }
+        UartConsole::drain(UartConsole::DrainBudget);
         if ((
             this->session_mode == SESSION_EXTENDED ||
             this->session_mode == SESSION_REPROGRAMMING ||
@@ -869,6 +871,24 @@ void Kwp2000_server::process_ioctl_by_local_ident(uint8_t* args, uint16_t arg_le
         make_diag_neg_msg(SID_IOCTL_BY_LOCAL_IDENT, NRC_CONDITIONS_NOT_CORRECT_REQ_SEQ_ERROR);
     }
 }
+// Shared preflight for the request and the delayed test task. Cached numeric
+// values alone cannot prove a stopped engine or a usable ATF sample.
+static bool solenoid_test_inputs_valid(Gearbox* gearbox) {
+    if (gearbox == nullptr || egs_can_hal == nullptr) return false;
+    const uint16_t voltage = TCUIO::battery_mv();
+    const uint16_t fresh_engine_rpm = egs_can_hal->get_engine_rpm(100);
+    const uint16_t n2 = TCUIO::n2_rpm();
+    const uint16_t n3 = TCUIO::n3_rpm();
+    return fresh_engine_rpm == 0 &&
+           gearbox->sensor_data.engine_rpm == 0 &&
+           gearbox->sensor_data.input_rpm == 0 &&
+           n2 != UINT16_MAX && n3 != UINT16_MAX &&
+           TCUIO::output_rpm() == 0 &&
+           voltage != UINT16_MAX && voltage > 10000 &&
+           TCUIO::parking_lock() == 0 &&
+           TCUIO::atf_temperature_valid();
+}
+
 void Kwp2000_server::process_start_routine_by_local_ident(uint8_t* args, uint16_t arg_len) {
     if (this->session_mode != SESSION_EXTENDED && this->session_mode != SESSION_CUSTOM_UN52 && this->session_mode != SESSION_REPROGRAMMING) {
         make_diag_neg_msg(SID_START_ROUTINE_BY_LOCAL_IDENT, NRC_SERVICE_NOT_SUPPORTED_IN_ACTIVE_DIAG_SESSION);
@@ -907,16 +927,7 @@ void Kwp2000_server::process_start_routine_by_local_ident(uint8_t* args, uint16_
 
     if (arg_len == 1) {
         if (args[0] == ROUTINE_SOLENOID_TEST) {
-            uint16_t voltage = TCUIO::battery_mv();
-            uint16_t pll = TCUIO::parking_lock();
-            if (
-                    gearbox_ptr->sensor_data.engine_rpm == 0 && //Engine off
-                    gearbox_ptr->sensor_data.input_rpm == 0 && // Not moving
-
-                    voltage != UINT16_MAX &&
-                    voltage > 10000 && // Enough battery voltage
-                    pll == 0 // Parking lock off (In D/R)
-                ) {
+            if (solenoid_test_inputs_valid(this->gearbox_ptr)) {
                 this->routine_running = true;
                 this->routine_id = ROUTINE_SOLENOID_TEST;
                 xTaskCreate(Kwp2000_server::launch_solenoid_test, "RT_SOL_TEST", 2048, this, 5, &this->routine_task);
@@ -1288,6 +1299,15 @@ static_assert(sizeof(SolRtRes) == 1+2+6*6);
 
 void Kwp2000_server::run_solenoid_test() {
     vTaskDelay(50);
+    // A request can become unsafe during the boot/task handoff delay. Abort
+    // before publishing a result, inhibiting control, or energizing a solenoid.
+    if (!solenoid_test_inputs_valid(this->gearbox_ptr)) {
+        this->routine_results_len = 0;
+        this->routine_id = 0;
+        this->routine_running = false;
+        vTaskDelete(nullptr);
+        return;
+    }
     this->routine_results_len = 1 + sizeof(SolRtRes); // ATF temp (2 byte), (current off, current on, vbatt) (x6);
     memset(this->routine_result, 0, this->routine_results_len);
     this->routine_result[0] = this->routine_id;
@@ -1296,10 +1316,6 @@ void Kwp2000_server::run_solenoid_test() {
     SolRtRes res{};
     res.lid = this->routine_id;
     int16_t temp = TCUIO::atf_temperature();
-    uint8_t pll = TCUIO::parking_lock();
-    if (pll != 0 || INT16_MAX == temp) {
-        return; // Cannot function unless PLL is off
-    }
     res.atf_temp = temp;
     if (nullptr != this->gearbox_ptr) {
         this->gearbox_ptr->diag_inhibit_control();

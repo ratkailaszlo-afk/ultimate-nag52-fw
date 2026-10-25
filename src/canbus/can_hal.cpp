@@ -1,8 +1,10 @@
 #include "can_hal.h"
+#include <stdio.h>
 #include "board_config.h"
 #include "esp_check.h"
 #include "clock.hpp"
 #include "nvs/device_mode.h"
+#include "diag/uart_console.h"
 
 #include "../shifter/shifter_ewm.h"
 #include "../shifter/shifter_trrs.h"
@@ -141,12 +143,23 @@ void EgsBaseCan::task_loop() {
                     if (CHECK_MODE_BIT_ENABLED(DEVICE_MODE_CANLOGGER)) {
                         // Logging mode
                         char buf[35];
-                        int pos = 0;
-                        pos += sprintf(buf + pos, "CF->0x%04X", (uint16_t)rx.identifier);
-                        for (uint8_t i = 0; i < rx.data_length_code; i++) {
-                            pos += sprintf(buf + pos, "%02X", rx.data[i]);
+                        int pos = snprintf(buf, sizeof(buf), "CF->0x%04X", (uint16_t)rx.identifier);
+                        if (pos > 0 && static_cast<size_t>(pos) < sizeof(buf)) {
+                            const uint8_t data_length = rx.data_length_code > sizeof(rx.data)
+                                ? sizeof(rx.data) : rx.data_length_code;
+                            for (uint8_t i = 0; i < data_length; i++) {
+                                const size_t remaining = sizeof(buf) - static_cast<size_t>(pos);
+                                const int written = snprintf(buf + pos, remaining, "%02X", rx.data[i]);
+                                if (written != 2 || static_cast<size_t>(written) >= remaining) {
+                                    break;
+                                }
+                                pos += written;
+                            }
+                            if (static_cast<size_t>(pos) < sizeof(buf) - 1) {
+                                buf[pos++] = '\n';
+                                UartConsole::enqueue_text(buf, static_cast<size_t>(pos));
+                            }
                         }
-                        printf("%.*s\n", pos, buf);
                     } else {
                         if (this->diag_rx_id != 0 && rx.identifier == this->diag_rx_id) {
                             // ISO-TP Diag endpoint

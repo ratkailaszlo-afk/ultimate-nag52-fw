@@ -5,6 +5,8 @@
 #include "tcu_io.hpp"
 #include "sensors.h"
 #include <limits>
+#include <climits>
+#include <atomic>
 
 float RATIO_2_1 = 1.61;
 float DIFF_RATIO_F = 1.00;
@@ -29,6 +31,11 @@ TCUIO::OnePollSensor<int16_t> onepoll_motor_oil_temperature;
 SensorDataRaw raw_sensors;
 TransferCaseState last_transfer_case_pos = TransferCaseState::SNA;
 bool block_shifting = false;
+
+// Kept separate from the cached numeric getter so existing consumers never
+// receive an unexpected sentinel as a temperature.
+std::atomic<bool> atf_temp_valid{false};
+uint8_t last_atf_source = 0; // 0=none, 1=gearbox ADC, 2=fresh coolant CAN
 
 void init_smoothed_sensor(TCUIO::SmoothedSensor* dest, uint8_t buffer_size, int reset_value = 0) {
     dest->e_counter = 0;
@@ -117,6 +124,8 @@ esp_err_t TCUIO::setup_io_layer() {
     init_smoothed_sensor(&smoothed_sensor_out_rpm, 3, 0);
 
     init_smoothed_sensor(&smoothed_sensor_atf_temp, 12, 25); //250ms/20ms
+    atf_temp_valid.store(false, std::memory_order_relaxed);
+    last_atf_source = 0;
     init_smoothed_sensor(&smoothed_sensor_vbatt, 12, 12000); // 250ms/20ms
 
     init_onepoll(&onepoll_parking_lock);
@@ -134,27 +143,31 @@ esp_err_t TCUIO::setup_io_layer() {
     return ret;
 }
 
-bool was_reading_from_engine = false;
 void update_tft_sensor() {
-    // Quickhand expression here
-    // parking_lock == UINT8_MAX -> True (Since PLL is not readable, just use engine temp)
-    // parking_lock == 1 -> True (Since PLL is engaged, just use engine temp)
-    // parking_lock == 0 -> False (We CAN use TFT temp!)
-    bool atf_from_engine_temp = raw_sensors.parking_lock != 0;
+    // Publish invalid before changing the cached sample/source.
+    atf_temp_valid.store(false, std::memory_order_relaxed);
     add_to_onepoll_sensor(&onepoll_parking_lock, raw_sensors.parking_lock);
 
-    bool reset_average = was_reading_from_engine != atf_from_engine_temp; // State change
-    int temperature = 25;
-    if (atf_from_engine_temp) {
-        // Request value from CAN
-        temperature = onepoll_motor_temperature.current_value;
-    } else {
-        // Use TFT value
+    // INT_MAX is the raw ADC failure sentinel. An unknown park lock does not
+    // authorize either temperature source. Coolant must be fresh this cycle:
+    // current_value alone survives CAN expiry in OnePollSensor.
+    uint8_t source = 0;
+    int temperature = INT_MAX;
+    if (raw_sensors.parking_lock == 0 && raw_sensors.atf_temp_c != INT_MAX) {
+        source = 1;
         temperature = raw_sensors.atf_temp_c;
+    } else if (raw_sensors.parking_lock == 1) {
+        const int16_t coolant = get_onepoll_sensor_val(&onepoll_motor_temperature, 0);
+        if (coolant != INT16_MAX) {
+            source = 2;
+            temperature = coolant;
+        }
     }
-    // Temperature might be INT16_MAX (Something wrong with the signal)
-    add_to_smoothed_sensor(&smoothed_sensor_atf_temp, temperature, reset_average);
-    was_reading_from_engine = atf_from_engine_temp;
+
+    const bool source_changed = source != last_atf_source;
+    add_to_smoothed_sensor(&smoothed_sensor_atf_temp, temperature, source_changed);
+    atf_temp_valid.store(source != 0 && smoothed_sensor_atf_temp.e_counter == 0, std::memory_order_relaxed);
+    last_atf_source = source;
 }
 
 void update_rpm_sensors() {
@@ -278,6 +291,7 @@ uint16_t TCUIO::calc_turbine_rpm(const uint16_t n2, const uint16_t n3) {
 
 uint8_t TCUIO::parking_lock() { return get_onepoll_sensor_val(&onepoll_parking_lock, 0); }
 int16_t TCUIO::atf_temperature() { return smoothed_sensor_atf_temp.last_value/100;}
+bool TCUIO::atf_temperature_valid() { return atf_temp_valid.load(std::memory_order_relaxed); }
 uint16_t TCUIO::battery_mv() { return smoothed_sensor_vbatt.last_value/100;}
 uint16_t TCUIO::n2_rpm() { 
     return get_smoothed_sensor_val_unsigned(&smoothed_sensor_n2_rpm, 0); 

@@ -1,5 +1,6 @@
 #include "gearbox.h"
 #include "tcc_trace.h"
+#include "runtime_signal_policy.h"
 #include "esp_timer.h"
 #include "common_structs_ops.h"
 #include "nvs/eeprom_config.h"
@@ -791,6 +792,9 @@ void Gearbox::shift_thread()
 cleanup:
     ESP_LOG_LEVEL(ESP_LOG_INFO, "SHIFTER", "Shift complete");
     this->set_torque_request(TorqueRequestControlType::None, TorqueRequestBounds::LessThan, 0);
+    // The shift thread owns this lifecycle, including selector abort and
+    // algorithm failure before the phase-specific normal shift_end calls.
+    if (this->tcc != nullptr) this->tcc->shift_end();
     this->shifting = false;
     this->fwd_gear_shift = false;
     this->is_upshift = false;
@@ -835,6 +839,9 @@ void Gearbox::controller_loop()
         }
         vTaskDelay(5);
     }
+    bool previous_speeds_valid = true;
+    bool previous_engine_valid = true;
+    bool previous_pedal_valid = true;
     while (1)
     {
         uint32_t start = GET_CLOCK_TIME();
@@ -849,6 +856,8 @@ void Gearbox::controller_loop()
         cycle_trace.profile = trace_profile_at_start ? uint8_t(trace_profile_at_start->get_profile()) : 0xFF;
         TCUIO::update_io_layer();
         if (CHECK_MODE_BIT_ENABLED(DEVICE_MODE_SLAVE)) {
+            if (this->tcc) this->tcc->suspend(this->pressure_mgr);
+            previous_speeds_valid = previous_engine_valid = previous_pedal_valid = false;
             SOLENOID_CONTROL_EGS_SLAVE slave_rq = egs_can_hal->get_tester_req();
             sol_mpc->set_current_target(__builtin_bswap16(slave_rq.MPC_REQ));
             sol_spc->set_current_target(__builtin_bswap16(slave_rq.SPC_REQ));
@@ -904,11 +913,18 @@ void Gearbox::controller_loop()
         }
         if (this->diag_stop_control)
         {
+            if (this->tcc) this->tcc->suspend(this->pressure_mgr);
+            previous_speeds_valid = previous_engine_valid = previous_pedal_valid = false;
             cycle_trace.path = 0; // Diagnostic stop skips the controller update.
             TccTrace::append(cycle_trace);
             vTaskDelay(50);
             continue;
         }
+
+        // Use this cycle's valid ATF before any pressure/TCC decisions. On a
+        // source fault retain only the last numerical value for an active shift.
+        const bool atf_valid = TCUIO::atf_temperature_valid();
+        if (atf_valid) this->sensor_data.atf_temp = TCUIO::atf_temperature();
 
         // Set sensors Motor temperature (Always ran)
         int16_t coolant_temp = egs_can_hal->get_engine_coolant_temp(50);
@@ -917,6 +933,10 @@ void Gearbox::controller_loop()
         bool speeds_valid = this->process_speed_sensors(&coast_raw_speeds_valid);
         if (speeds_valid)
         {
+            if (!previous_speeds_valid) {
+                this->cached_input_rpm = speed_sensors.turbine * 100;
+                this->cached_output_rpm = speed_sensors.output * 100;
+            }
             this->cached_input_rpm = first_order_filter(3, speed_sensors.turbine * 100, this->cached_input_rpm);
             this->sensor_data.input_rpm = this->cached_input_rpm / 100;
             this->cached_output_rpm = first_order_filter(3, speed_sensors.output * 100, this->cached_output_rpm);
@@ -973,6 +993,7 @@ void Gearbox::controller_loop()
             speeds_valid = false;
             gear_disagree_count = 0;
         }
+        previous_speeds_valid = speeds_valid;
         if (speeds_valid && !this->is_stationary())
         {
             bool rev = !is_fwd_gear(this->target_gear);
@@ -981,16 +1002,18 @@ void Gearbox::controller_loop()
                 // ESP_LOG_LEVEL(ESP_LOG_ERROR, "GEARBOX", "GEAR RATIO IMPLAUSIBLE");
             }
         }
-        uint8_t p_tmp = egs_can_hal->get_pedal_value(1000);
+        const uint8_t p_tmp = egs_can_hal->get_pedal_value(100);
+        const bool pedal_valid = p_tmp != UINT8_MAX;
         this->pedal_last = this->sensor_data.pedal_pos;
-        if (p_tmp != 0xFF)
+        if (pedal_valid)
         {
             this->sensor_data.pedal_pos = p_tmp;
+            if (!previous_pedal_valid) this->sensor_data.pedal_pos_smoothed = p_tmp;
+            this->sensor_data.pedal_pos_smoothed = linear_interp_with_percentage(80, p_tmp, this->sensor_data.pedal_pos_smoothed);
         }
-        else {
-            p_tmp = 250 / 4; // 25% as a fallback
-        }
-        this->sensor_data.pedal_pos_smoothed = linear_interp_with_percentage(80, p_tmp, this->sensor_data.pedal_pos_smoothed);
+        // Missing pedal does not synthesize 25% demand. Both caches are held;
+        // the separate current validity gates all new forward control below.
+        previous_pedal_valid = pedal_valid;
 
         if (GET_CLOCK_TIME() - start > 100) {
             // Update every 100ms, not every EGS cycle, values multiplied by 10
@@ -1006,18 +1029,19 @@ void Gearbox::controller_loop()
 
         sensor_data.brake_pressed = brake_pedal.is_brake_pedal_pressed(egs_can_hal, 250);
         sensor_data.kickdown_pressed = kickdown.is_kickdown_newly_pressed(egs_can_hal, 250);
-        int tmp_rpm = 0;
-        tmp_rpm = egs_can_hal->get_engine_rpm(1000);
-        if (tmp_rpm == UINT16_MAX)
-        {
-            tmp_rpm = this->sensor_data.engine_rpm; // Sub last value!
+        const uint16_t tmp_rpm = egs_can_hal->get_engine_rpm(100);
+        const bool engine_valid = tmp_rpm != UINT16_MAX;
+        if (engine_valid) {
+            if (!previous_engine_valid) this->cached_engine_rpm = tmp_rpm * 100;
+            this->cached_engine_rpm = first_order_filter(3, tmp_rpm * 100, this->cached_engine_rpm);
+            this->sensor_data.engine_rpm = this->cached_engine_rpm / 100;
         }
-        this->cached_engine_rpm = first_order_filter(3, tmp_rpm * 100, this->cached_engine_rpm);
-        this->sensor_data.engine_rpm = this->cached_engine_rpm / 100;
-        // Observe every loop, not only when the automatic profile decision runs.
-        // The existing 1000ms pedal/fallback behavior above is deliberately unchanged.
-        const uint8_t coast_pedal = egs_can_hal->get_pedal_value(100);
-        const uint16_t coast_engine_rpm = egs_can_hal->get_engine_rpm(100);
+        previous_engine_valid = engine_valid;
+        const RuntimeSignalPolicy signals{engine_valid, pedal_valid, speeds_valid, atf_valid, tmp_rpm};
+        const bool forward_control_valid = signals.forward_control_allowed();
+        // The coast filter observes the same current CAN samples.
+        const uint8_t coast_pedal = p_tmp;
+        const uint16_t coast_engine_rpm = tmp_rpm;
         const bool coast_engine_valid = coast_engine_rpm != UINT16_MAX && coast_engine_rpm > 100 &&
             this->redline_rpm > 500 && coast_engine_rpm < this->redline_rpm - 500;
         portENTER_CRITICAL(&this->profile_mutex);
@@ -1032,7 +1056,7 @@ void Gearbox::controller_loop()
         }
 
         // Update solenoids, only if engine RPM is OK
-        if (tmp_rpm > 400)
+        if (engine_valid && atf_valid && tmp_rpm > 400)
         {
             if (!shifting)
             {
@@ -1044,7 +1068,7 @@ void Gearbox::controller_loop()
         if (UINT8_MAX != pll)
         {
             bool lock_state = pll != 0;
-            if (lock_state) {
+            if (lock_state && engine_valid && atf_valid) {
                 this->mpc_working = pressure_mgr->find_working_mpc_pressure(this->actual_gear, true);
                 this->pressure_mgr->set_target_modulating_pressure(this->mpc_working);
                 this->pressure_mgr->set_target_shift_pressure(4000);
@@ -1128,9 +1152,14 @@ void Gearbox::controller_loop()
                 }
             }
         }
-        if (this->sensor_data.engine_rpm > 100)
+        if (!forward_control_valid) {
+            this->ask_downshift = false;
+            this->ask_upshift = false;
+            this->manual_shift = false;
+        }
+        if (engine_valid && tmp_rpm > 100)
         {
-            if (speeds_valid && is_fwd_gear(this->actual_gear))
+            if (forward_control_valid && is_fwd_gear(this->actual_gear))
             {
                 // Check our range restict (Only for TRRS)
                 switch (egs_can_hal->get_shifter_position(250)) { // Don't use shifter_pos, as that only registers D. Query raw selector pos
@@ -1207,95 +1236,72 @@ void Gearbox::controller_loop()
                 this->shift_req_was_manual = this->manual_shift;
                 this->manual_shift = false;
 
-                if (is_fwd_gear(this->target_gear))
-                {
-                    if (this->tcc != nullptr)
-                    {
-                        // Profiles live for the lifetime of the TCU; only snapshot the pointer under lock.
-                        portENTER_CRITICAL(&this->profile_mutex);
-                        AbstractProfile* tcc_profile = this->current_profile;
-                        portEXIT_CRITICAL(&this->profile_mutex);
-                        cycle_trace.path = 1;
-                        cycle_trace.flags = (cycle_trace.flags & ~TccTrace::UPDATE_SKIPPED) | TccTrace::INPUT_VALID;
-                        cycle_trace.profile = tcc_profile ? uint8_t(tcc_profile->get_profile()) : 0xFF;
-                        cycle_trace.actual_gear = uint8_t(this->actual_gear);
-                        cycle_trace.target_gear = uint8_t(this->target_gear);
-                        cycle_trace.engine_rpm_at_tcc = this->sensor_data.engine_rpm;
-                        cycle_trace.input_rpm_at_tcc = this->sensor_data.input_rpm;
-                        cycle_trace.output_rpm_at_tcc = this->sensor_data.output_rpm;
-                        cycle_trace.converted_torque_at_tcc = this->sensor_data.converted_torque;
-                        cycle_trace.atf_c_at_tcc = this->sensor_data.atf_temp;
-                        cycle_trace.pedal_at_tcc = this->sensor_data.pedal_pos;
-                        cycle_trace.pedal_smoothed_at_tcc = this->sensor_data.pedal_pos_smoothed;
-                        cycle_trace.coast_raw_pedal = coast_pedal;
-                        cycle_trace.coast_engine_rpm = coast_engine_rpm;
-                        cycle_trace.quality_flags = (speeds_valid ? 1 : 0) | (coast_raw_speeds_valid ? 2 : 0) |
-                            (coast_engine_valid ? 4 : 0) | (coast_pedal != UINT8_MAX ? 8 : 0);
-                        int32_t signed_slip = int32_t(cycle_trace.engine_rpm_at_tcc) - int32_t(cycle_trace.input_rpm_at_tcc);
-                        if (signed_slip > INT16_MAX) {
-                            cycle_trace.signed_engine_minus_input_rpm = INT16_MAX;
-                            cycle_trace.flags |= TccTrace::SIGNED_SLIP_SATURATED;
-                        } else if (signed_slip < INT16_MIN) {
-                            cycle_trace.signed_engine_minus_input_rpm = INT16_MIN;
-                            cycle_trace.flags |= TccTrace::SIGNED_SLIP_SATURATED;
-                        } else cycle_trace.signed_engine_minus_input_rpm = int16_t(signed_slip);
-                        this->tcc->trace_before(cycle_trace);
-                        this->tcc->update(this->actual_gear, this->target_gear, this->pressure_mgr, tcc_profile, &this->sensor_data);
-                        this->tcc->trace_after(cycle_trace);
-                        egs_can_hal->set_clutch_status(this->tcc->get_clutch_state());
-                    }
-                }
-            }
-            else { // Cannot read, or not in foward gear!
-                this->tcc_percent = 0;
-                this->pressure_mgr->set_target_tcc_pressure(0);
-                cycle_trace.path = 3; // PM target forced zero, TCC internal state untouched.
-                cycle_trace.actual_gear = uint8_t(this->actual_gear);
-                cycle_trace.target_gear = uint8_t(this->target_gear);
-                egs_can_hal->set_clutch_status(TccClutchStatus::Open);
-                // sol_tcc->write_pwm_12_bit(0);
-            }
-            // Not shifting, but target has changed! Spawn a shift thread!
-            if (this->target_gear != this->actual_gear && !this->shifting)
-            {
-                xTaskCreatePinnedToCore(Gearbox::start_shift_thread, "Shift handler", 8192, this, 10, &this->shift_task, 1);
             }
         }
-        else if (!shifting)
+        else if (signals.engine_stopped() && !shifting)
         {
-            sol_mpc->set_current_target(0);
-            sol_spc->set_current_target(0);
-            sol_tcc->set_duty(0);
             this->pressure_mgr->set_shift_circuit(ShiftCircuit::sc_1_2, false);
             this->pressure_mgr->set_shift_circuit(ShiftCircuit::sc_2_3, false);
             this->pressure_mgr->set_shift_circuit(ShiftCircuit::sc_3_4, false);
         }
 
-        int16_t tmp_atf = TCUIO::atf_temperature();
-        if (INT16_MAX != tmp_atf)
-        {
-            this->sensor_data.atf_temp = tmp_atf;
-        }
-        else
-        {
-            if (!temp_cal)
+        // A skipped update is a real suspension, not just a zero PM target.
+        // This covers P/N/R (including a non-forward target), signal faults and
+        // observed engine stop before the later PM output can reapply old state.
+        if (forward_control_valid && is_fwd_gear(this->actual_gear) && is_fwd_gear(this->target_gear)) {
+            if (this->tcc != nullptr)
             {
-                temp_cal = true;
-                temp_at_test = tmp_atf;
-                if (temp_at_test != 25)
-                {
-                    resistance_mpc = resistance_mpc + (resistance_mpc * (((25.0 - (float)temp_at_test) * 0.393) / 100.0));
-                    resistance_spc = resistance_spc + (resistance_spc * (((25.0 - (float)temp_at_test) * 0.393) / 100.0));
-                }
-                ESP_LOGI("GB", "Calibrated solenoids at %d C. Adjusted for 25C: SPC %.2f MPC %.2f", tmp_atf, resistance_spc, resistance_mpc);
+                // Profiles live for the lifetime of the TCU; only snapshot the pointer under lock.
+                portENTER_CRITICAL(&this->profile_mutex);
+                AbstractProfile* tcc_profile = this->current_profile;
+                portEXIT_CRITICAL(&this->profile_mutex);
+                cycle_trace.path = 1;
+                cycle_trace.flags = (cycle_trace.flags & ~TccTrace::UPDATE_SKIPPED) | TccTrace::INPUT_VALID;
+                cycle_trace.profile = tcc_profile ? uint8_t(tcc_profile->get_profile()) : 0xFF;
+                cycle_trace.actual_gear = uint8_t(this->actual_gear);
+                cycle_trace.target_gear = uint8_t(this->target_gear);
+                cycle_trace.engine_rpm_at_tcc = this->sensor_data.engine_rpm;
+                cycle_trace.input_rpm_at_tcc = this->sensor_data.input_rpm;
+                cycle_trace.output_rpm_at_tcc = this->sensor_data.output_rpm;
+                cycle_trace.converted_torque_at_tcc = this->sensor_data.converted_torque;
+                cycle_trace.atf_c_at_tcc = this->sensor_data.atf_temp;
+                cycle_trace.pedal_at_tcc = this->sensor_data.pedal_pos;
+                cycle_trace.pedal_smoothed_at_tcc = this->sensor_data.pedal_pos_smoothed;
+                cycle_trace.coast_raw_pedal = coast_pedal;
+                cycle_trace.coast_engine_rpm = coast_engine_rpm;
+                cycle_trace.quality_flags = (speeds_valid ? 1 : 0) | (coast_raw_speeds_valid ? 2 : 0) |
+                    (coast_engine_valid ? 4 : 0) | (coast_pedal != UINT8_MAX ? 8 : 0);
+                int32_t signed_slip = int32_t(cycle_trace.engine_rpm_at_tcc) - int32_t(cycle_trace.input_rpm_at_tcc);
+                if (signed_slip > INT16_MAX) {
+                    cycle_trace.signed_engine_minus_input_rpm = INT16_MAX;
+                    cycle_trace.flags |= TccTrace::SIGNED_SLIP_SATURATED;
+                } else if (signed_slip < INT16_MIN) {
+                    cycle_trace.signed_engine_minus_input_rpm = INT16_MIN;
+                    cycle_trace.flags |= TccTrace::SIGNED_SLIP_SATURATED;
+                } else cycle_trace.signed_engine_minus_input_rpm = int16_t(signed_slip);
+                this->tcc->trace_before(cycle_trace);
+                this->tcc->update(this->actual_gear, this->target_gear, this->pressure_mgr, tcc_profile, &this->sensor_data);
+                this->tcc->trace_after(cycle_trace);
+                egs_can_hal->set_clutch_status(this->tcc->get_clutch_state());
             }
-            // SPC and MPC can cause voltage swing on the ATF line, so disable
-            // monitoring when shifting gears!
-            if (!shifting)
-            {
-                this->sensor_data.atf_temp = tmp_atf;
-            }
+        } else {
+            this->tcc_percent = 0;
+            if (this->tcc) this->tcc->suspend(this->pressure_mgr);
+            else this->pressure_mgr->set_target_tcc_pressure(0);
+            cycle_trace.path = 3;
+            cycle_trace.actual_gear = uint8_t(this->actual_gear);
+            cycle_trace.target_gear = uint8_t(this->target_gear);
+            egs_can_hal->set_clutch_status(TccClutchStatus::Open);
         }
+
+        // Keep shift-thread creation after the TCC decision, as in the stable base.
+        if (this->target_gear != this->actual_gear && !this->shifting &&
+            signals.new_shift_allowed(is_fwd_gear(this->actual_gear), is_fwd_gear(this->target_gear),
+                this->target_gear == GearboxGear::Park || this->target_gear == GearboxGear::Neutral))
+        {
+            xTaskCreatePinnedToCore(Gearbox::start_shift_thread, "Shift handler", 8192, this, 10, &this->shift_task, 1);
+        }
+
         egs_can_hal->set_gearbox_temperature(this->sensor_data.atf_temp);
         egs_can_hal->set_shifter_position(this->shifter_pos);
         egs_can_hal->set_input_shaft_speed(this->sensor_data.input_rpm);
@@ -1446,6 +1452,13 @@ void Gearbox::controller_loop()
         }
         portEXIT_CRITICAL(&this->profile_mutex);
         pressure_mgr->update_pressures(this->actual_gear, GearChange::_IDLE);
+        // Apply the confirmed engine-stop electrical state after PM so its
+        // retained targets cannot immediately undo it. Lost CAN is not STOP.
+        if (signals.engine_stopped() && !this->shifting) {
+            sol_mpc->set_current_target(0);
+            sol_spc->set_current_target(0);
+            sol_tcc->set_duty(0);
+        }
         // This is the later PM output point; input fields above remain the exact TCC snapshot.
         cycle_trace.pm_requested_mbar = pressure_mgr->get_targ_tcc_pressure();
         cycle_trace.pm_final_pwm_raw = sol_tcc->get_pwm_raw();
@@ -1477,7 +1490,7 @@ bool Gearbox::process_speed_sensors(bool* raw_signals_valid)
     uint16_t n3 = TCUIO::n3_rpm();
     uint16_t output = TCUIO::output_rpm();
     if (raw_signals_valid != nullptr) {
-        // Export validity from the same sample; keep the legacy fallback/return unchanged.
+        // Export validity from the same sample as the control decision.
         *raw_signals_valid = n2 != UINT16_MAX && n3 != UINT16_MAX && output != UINT16_MAX;
     }
 
@@ -1493,6 +1506,10 @@ bool Gearbox::process_speed_sensors(bool* raw_signals_valid)
         }
         this->speed_sensors.n2 = n2;
         this->speed_sensors.n3 = n3;
+    }
+
+    if (UINT16_MAX == n2 || UINT16_MAX == n3) {
+        ok = false; // A cached turbine value is not a current input measurement.
     }
 
     if (UINT16_MAX != output) {

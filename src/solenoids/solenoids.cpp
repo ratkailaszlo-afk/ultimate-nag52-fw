@@ -136,7 +136,8 @@ void update_solenoids(void*) {
         else {
             vref_compensation = 1.0;
         }
-        if (INT16_MAX != atf) {
+        // Keep the last good compensation while the selected ATF source is invalid.
+        if (TCUIO::atf_temperature_valid() && INT16_MAX != atf) {
             atf_temp = atf * 10.0;
             temp_compensation = (((atf_temp - (SOL_CURRENT_SETTINGS.cc_reference_temp * 10.0)) / 10.0) * SOL_CURRENT_SETTINGS.cc_temp_coefficient_wires) / 10.0;
         }

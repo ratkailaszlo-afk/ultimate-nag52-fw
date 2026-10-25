@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <driver/uart.h>
+#include <freertos/semphr.h>
 #include "esp_log.h"
 #include "string.h"
 #include "canbus/can_hal.h"
@@ -60,6 +61,7 @@ private:
     // Read msg size: 6 bytes: USB message size: 14 = (Read size *2) + 2
     char *read_buffer;
     char *write_buffer;
+    SemaphoreHandle_t write_mutex;
     uint16_t read_pos;
     bool clear_to_send = false;
     int data_size;

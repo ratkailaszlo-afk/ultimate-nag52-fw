@@ -34,6 +34,9 @@ class TorqueConverter {
          * @param shifting True if the car is currently transitioning to new gear
          */
         void update(GearboxGear curr_gear, GearboxGear targ_gear, PressureManager* pm, AbstractProfile* profile, SensorData* sensors);
+        // Force the converter control open when the gearbox cannot run update().
+        // Shift-thread flags remain owned by the shifting algorithm.
+        void suspend(PressureManager* pm);
         TccClutchStatus get_clutch_state(void);
         void save() {
             if (this->tcc_lock_map) {

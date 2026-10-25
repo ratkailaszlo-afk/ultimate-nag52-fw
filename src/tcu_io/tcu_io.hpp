@@ -63,6 +63,8 @@ namespace TCUIO {
 
     uint8_t parking_lock();
     int16_t atf_temperature();
+    // Valid only when the current known source supplied a fresh sample this cycle.
+    bool atf_temperature_valid();
     uint16_t battery_mv();
     uint16_t n2_rpm();
     uint16_t n3_rpm();

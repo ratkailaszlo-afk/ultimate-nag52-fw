@@ -13,6 +13,7 @@
 #include "dtcs.h"
 #include "nvs/eeprom_config.h"
 #include "diag/kwp2000.h"
+#include "diag/uart_console.h"
 #include "nvs/module_settings.h"
 #include "egs_calibration/calibration_structs.h"
 
@@ -308,6 +309,8 @@ const char *post_code_to_str(SPEAKER_POST_CODE s)
 
 extern "C" void app_main(void)
 {
+    // Capture diagnostics before setup_tcm starts CAN and gearbox tasks.
+    UartConsole::init();
     esp_log_level_set("gpio", esp_log_level_t::ESP_LOG_NONE);
     // Set all pointers
     gearbox = nullptr;
