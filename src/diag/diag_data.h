@@ -35,6 +35,7 @@
 #define RLI_CURR_SW_PART_INFO   0x2A // Current FW size and address
 #define RLI_NEXT_SW_PART_INFO   0x2B // Current FW size and address
 #define RLI_EMBED_FILE_INFO     0x2C // location and len of EMBED.ZIP
+#define RLI_TCC_CYCLE_TRACE     0x2D // read-only TCC cycle trace
 
 #define RLI_CLUTCH_SPEEDS   0x30
 #define RLI_SHIFTING_ALGO   0x31
@@ -214,3 +215,4 @@ uint16_t get_egs_calibration_size(void);
 const esp_app_desc_t* get_image_header(void);
 
 #endif // __DIAG_DATA_H__
+

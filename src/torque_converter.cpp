@@ -89,6 +89,7 @@ int16_t get_cell_value(int16_t* dest, GearboxGear gear, uint8_t load_idx) {
 
 
 void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, PressureManager* pm, AbstractProfile* profile, SensorData* sensors) {
+    this->trace_prefill_taken = false;
     // Selected CAN request before reaction flags; snapshot also updates on disable paths.
     const TccReqState engine_req_state = (egs_can_hal != nullptr)
         ? egs_can_hal->get_engine_tcc_override_request(500) : TccReqState::None;
@@ -120,6 +121,7 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
         !init_tables_ok // Some data was not initialized or invalid
     ) {
         this->tcc_commanded_pressure = 0;
+        this->trace_command_before_atf = 0;
         pm->set_target_tcc_pressure(this->tcc_commanded_pressure);
         this->current_tcc_state = InternalTccState::Open;
         this->target_tcc_state = InternalTccState::Open;
@@ -280,6 +282,7 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
     // Prefilling when suddenly increasing state requested
     if (this->target_tcc_state > this->current_tcc_state && this->tcc_actual_pressure/100 < 100 && !prefill_done) {
         // Prefill logic
+        this->trace_prefill_taken = true;
         if (false == prefill_running) {
             // Var setup (Start of prefill)
             prefill_running = true;
@@ -353,6 +356,7 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
         this->prefill_done = false;
         this->prefill_running = false;
     }
+    this->trace_command_before_atf = this->tcc_commanded_pressure;
     // OEM EGS - Below 60C, TCC pressure is reduced by a factor based on
     // ATF temperature
     if (sensors->atf_temp < TCC_CURRENT_SETTINGS.tcc_temp_multiplier.raw_max) {
@@ -436,3 +440,42 @@ void TorqueConverter::shift_start(bool upshift, bool release_shifting) {
 void TorqueConverter::shift_end() {
     this->is_shifting = false;
 }
+static uint16_t trace_u16(int value, TccTraceRecord& r) {
+    if (value < 0) { r.flags |= TccTrace::PRESSURE_SATURATED; return 0; }
+    if (value > UINT16_MAX) { r.flags |= TccTrace::PRESSURE_SATURATED; return UINT16_MAX; }
+    return uint16_t(value);
+}
+static int16_t trace_i16(int value, TccTraceRecord& r) {
+    if (value < INT16_MIN) { r.flags |= TccTrace::FILTERED_SLIP_SATURATED; return INT16_MIN; }
+    if (value > INT16_MAX) { r.flags |= TccTrace::FILTERED_SLIP_SATURATED; return INT16_MAX; }
+    return int16_t(value);
+}
+void TorqueConverter::trace_before(TccTraceRecord& r) const {
+    r.state_before = uint8_t(current_tcc_state);
+    r.target_before = uint8_t(target_tcc_state);
+    r.prefill_flags_before = (prefill_running ? 1 : 0) | (prefill_done ? 2 : 0);
+    r.prefill_cycles_before = prefill_cycles;
+    r.slip_target_before_rpm = slip_target;
+    if (is_shifting) r.flags |= TccTrace::SHIFTING;
+    if (release_shifting) r.flags |= TccTrace::RELEASE;
+    if (upshifting) r.flags |= TccTrace::UPSHIFT;
+    if (was_shifting) r.flags |= TccTrace::WAS_SHIFTING;
+}
+void TorqueConverter::trace_after(TccTraceRecord& r) const {
+    r.state_after = uint8_t(current_tcc_state);
+    r.target_after = uint8_t(target_tcc_state);
+    r.prefill_flags_after = (prefill_running ? 1 : 0) | (prefill_done ? 2 : 0);
+    r.prefill_cycles_after = prefill_cycles;
+    r.slip_target_after_rpm = slip_target;
+    r.selected_can_request_bits = can_request_bits.load(std::memory_order_relaxed);
+    r.filtered_absolute_slip_rpm = trace_i16(tcc_slip_filtered/100, r);
+    r.command_before_atf_mbar = trace_u16(trace_command_before_atf, r);
+    r.command_after_atf_mbar = trace_u16(tcc_commanded_pressure, r);
+    r.filtered_model_pressure_centimbar = tcc_actual_pressure;
+    if (r.flags & TccTrace::INPUT_VALID) {
+        if (trace_prefill_taken) r.flags |= TccTrace::PREFILL_BRANCH;
+        if (!tcc_solenoid_enabled || !init_tables_ok) r.path = 2;
+    }
+}
+
+

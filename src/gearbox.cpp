@@ -1,4 +1,6 @@
 #include "gearbox.h"
+#include "tcc_trace.h"
+#include "esp_timer.h"
 #include "common_structs_ops.h"
 #include "nvs/eeprom_config.h"
 #include "adv_opts.h"
@@ -45,6 +47,7 @@ int calc_input_rpm_from_req_gear(const int output_rpm, const GearboxGear req_gea
 
 Gearbox::Gearbox(Shifter* shifter) : shifter(shifter), kickdown(), brake_pedal()
 {
+    TccTrace::init();
     this->current_profile = nullptr;
     egs_can_hal->set_drive_profile(GearboxProfile::Underscore); // Uninitialized
     this->profile_mutex = portMUX_INITIALIZER_UNLOCKED;
@@ -835,6 +838,15 @@ void Gearbox::controller_loop()
     while (1)
     {
         uint32_t start = GET_CLOCK_TIME();
+        TccTraceRecord cycle_trace = {};
+        cycle_trace.timestamp_us = uint64_t(esp_timer_get_time());
+        cycle_trace.flags = TccTrace::UPDATE_SKIPPED | TccTrace::CAN_FRESHNESS_UNKNOWN;
+        cycle_trace.actual_gear = uint8_t(this->actual_gear);
+        cycle_trace.target_gear = uint8_t(this->target_gear);
+        portENTER_CRITICAL(&this->profile_mutex);
+        AbstractProfile* trace_profile_at_start = this->current_profile;
+        portEXIT_CRITICAL(&this->profile_mutex);
+        cycle_trace.profile = trace_profile_at_start ? uint8_t(trace_profile_at_start->get_profile()) : 0xFF;
         TCUIO::update_io_layer();
         if (CHECK_MODE_BIT_ENABLED(DEVICE_MODE_SLAVE)) {
             SOLENOID_CONTROL_EGS_SLAVE slave_rq = egs_can_hal->get_tester_req();
@@ -885,11 +897,15 @@ void Gearbox::controller_loop()
             un52_rpt.TCC_CURR = __builtin_bswap16(sol_tcc->get_current());
 
             egs_can_hal->set_slave_mode_reports(sol_rpt, sensor_rpt, un52_rpt);
+            cycle_trace.path = 0; // Slave mode bypasses normal TCC/PM control.
+            TccTrace::append(cycle_trace);
             vTaskDelay(20);
             continue;
         }
         if (this->diag_stop_control)
         {
+            cycle_trace.path = 0; // Diagnostic stop skips the controller update.
+            TccTrace::append(cycle_trace);
             vTaskDelay(50);
             continue;
         }
@@ -1199,7 +1215,33 @@ void Gearbox::controller_loop()
                         portENTER_CRITICAL(&this->profile_mutex);
                         AbstractProfile* tcc_profile = this->current_profile;
                         portEXIT_CRITICAL(&this->profile_mutex);
+                        cycle_trace.path = 1;
+                        cycle_trace.flags = (cycle_trace.flags & ~TccTrace::UPDATE_SKIPPED) | TccTrace::INPUT_VALID;
+                        cycle_trace.profile = tcc_profile ? uint8_t(tcc_profile->get_profile()) : 0xFF;
+                        cycle_trace.actual_gear = uint8_t(this->actual_gear);
+                        cycle_trace.target_gear = uint8_t(this->target_gear);
+                        cycle_trace.engine_rpm_at_tcc = this->sensor_data.engine_rpm;
+                        cycle_trace.input_rpm_at_tcc = this->sensor_data.input_rpm;
+                        cycle_trace.output_rpm_at_tcc = this->sensor_data.output_rpm;
+                        cycle_trace.converted_torque_at_tcc = this->sensor_data.converted_torque;
+                        cycle_trace.atf_c_at_tcc = this->sensor_data.atf_temp;
+                        cycle_trace.pedal_at_tcc = this->sensor_data.pedal_pos;
+                        cycle_trace.pedal_smoothed_at_tcc = this->sensor_data.pedal_pos_smoothed;
+                        cycle_trace.coast_raw_pedal = coast_pedal;
+                        cycle_trace.coast_engine_rpm = coast_engine_rpm;
+                        cycle_trace.quality_flags = (speeds_valid ? 1 : 0) | (coast_raw_speeds_valid ? 2 : 0) |
+                            (coast_engine_valid ? 4 : 0) | (coast_pedal != UINT8_MAX ? 8 : 0);
+                        int32_t signed_slip = int32_t(cycle_trace.engine_rpm_at_tcc) - int32_t(cycle_trace.input_rpm_at_tcc);
+                        if (signed_slip > INT16_MAX) {
+                            cycle_trace.signed_engine_minus_input_rpm = INT16_MAX;
+                            cycle_trace.flags |= TccTrace::SIGNED_SLIP_SATURATED;
+                        } else if (signed_slip < INT16_MIN) {
+                            cycle_trace.signed_engine_minus_input_rpm = INT16_MIN;
+                            cycle_trace.flags |= TccTrace::SIGNED_SLIP_SATURATED;
+                        } else cycle_trace.signed_engine_minus_input_rpm = int16_t(signed_slip);
+                        this->tcc->trace_before(cycle_trace);
                         this->tcc->update(this->actual_gear, this->target_gear, this->pressure_mgr, tcc_profile, &this->sensor_data);
+                        this->tcc->trace_after(cycle_trace);
                         egs_can_hal->set_clutch_status(this->tcc->get_clutch_state());
                     }
                 }
@@ -1207,6 +1249,9 @@ void Gearbox::controller_loop()
             else { // Cannot read, or not in foward gear!
                 this->tcc_percent = 0;
                 this->pressure_mgr->set_target_tcc_pressure(0);
+                cycle_trace.path = 3; // PM target forced zero, TCC internal state untouched.
+                cycle_trace.actual_gear = uint8_t(this->actual_gear);
+                cycle_trace.target_gear = uint8_t(this->target_gear);
                 egs_can_hal->set_clutch_status(TccClutchStatus::Open);
                 // sol_tcc->write_pwm_12_bit(0);
             }
@@ -1401,6 +1446,17 @@ void Gearbox::controller_loop()
         }
         portEXIT_CRITICAL(&this->profile_mutex);
         pressure_mgr->update_pressures(this->actual_gear, GearChange::_IDLE);
+        // This is the later PM output point; input fields above remain the exact TCC snapshot.
+        cycle_trace.pm_requested_mbar = pressure_mgr->get_targ_tcc_pressure();
+        cycle_trace.pm_final_pwm_raw = sol_tcc->get_pwm_raw();
+        cycle_trace.pm_path = cycle_trace.path == 3 ? 2 : 1;
+        cycle_trace.flags |= TccTrace::PM_VALID;
+        if (!(cycle_trace.flags & TccTrace::INPUT_VALID) && this->tcc) {
+            this->tcc->trace_before(cycle_trace);
+            this->tcc->trace_after(cycle_trace);
+            cycle_trace.selected_can_request_bits = this->tcc->get_can_req_bits();
+        }
+        TccTrace::append(cycle_trace);
         uint32_t time = GET_CLOCK_TIME() - start;
         if (time < 20) {
             vTaskDelay((20 - time) / portTICK_PERIOD_MS); // 50 updates/sec!
@@ -1484,3 +1540,5 @@ bool Gearbox::calcGearFromRatio(bool is_reverse)
 }
 
 Gearbox* gearbox = nullptr;
+
+

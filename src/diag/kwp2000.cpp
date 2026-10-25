@@ -3,6 +3,7 @@
 #include <string>
 #include <time.h>
 #include "diag_data.h"
+#include "tcc_trace.h"
 #include "egs_emulation.h"
 #include "kwp_utils.h"
 #include "map_editor.h"
@@ -503,7 +504,11 @@ void Kwp2000_server::process_read_ecu_ident(const uint8_t* args, uint16_t arg_le
 }
 
 void Kwp2000_server::process_read_data_local_ident(uint8_t* args, uint16_t arg_len) {
-    if (arg_len != 1 && (args[0] != RLI_MAP_EDITOR && args[0] != RLI_SETTINGS_EDIT)) {
+    if (!args || arg_len == 0) {
+        make_diag_neg_msg(SID_READ_DATA_LOCAL_IDENT, NRC_SUB_FUNC_NOT_SUPPORTED_INVALID_FORMAT);
+        return;
+    }
+    if (arg_len != 1 && (args[0] != RLI_MAP_EDITOR && args[0] != RLI_SETTINGS_EDIT && args[0] != RLI_TCC_CYCLE_TRACE)) {
         make_diag_neg_msg(SID_READ_DATA_LOCAL_IDENT, NRC_SUB_FUNC_NOT_SUPPORTED_INVALID_FORMAT);
         return;
     }
@@ -520,6 +525,22 @@ void Kwp2000_server::process_read_data_local_ident(uint8_t* args, uint16_t arg_l
         char resp[13];
         sprintf(resp, "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         make_diag_pos_msg(SID_READ_DATA_LOCAL_IDENT, 0xE1, reinterpret_cast<const uint8_t*>(resp), 12);
+    } else if (args[0] == RLI_TCC_CYCLE_TRACE) {
+        if (!this->diag_on_usb) {
+            make_diag_neg_msg(SID_READ_DATA_LOCAL_IDENT, NRC_REQUEST_OUT_OF_RANGE);
+            return;
+        }
+        if (arg_len != 16) {
+            make_diag_neg_msg(SID_READ_DATA_LOCAL_IDENT, NRC_SUB_FUNC_NOT_SUPPORTED_INVALID_FORMAT);
+            return;
+        }
+        uint8_t page[40 + 16*72] = {};
+        size_t used = 0;
+        if (!TccTrace::read_page(args, page, sizeof(page), &used)) {
+            make_diag_neg_msg(SID_READ_DATA_LOCAL_IDENT, NRC_REQUEST_OUT_OF_RANGE);
+            return;
+        }
+        make_diag_pos_msg(SID_READ_DATA_LOCAL_IDENT, RLI_TCC_CYCLE_TRACE, page, used);
     } else if (args[0] == RLI_MAP_EDITOR) {
         // 0 - RLI
         // 1 - Map ID
@@ -1307,3 +1328,4 @@ void Kwp2000_server::run_solenoid_test() {
     memcpy(this->routine_result, &res, sizeof(SolRtRes));
     vTaskDelete(nullptr);
 }
+

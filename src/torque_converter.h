@@ -11,6 +11,7 @@
 #include "pressure_manager.h"
 #include "canbus/can_hal.h"
 #include "nvs/module_settings.h"
+#include "tcc_trace.h"
 
 enum class InternalTccState {
     Open = 0,
@@ -44,6 +45,8 @@ class TorqueConverter {
         };
 
         void diag_toggle_tcc_sol(bool en);
+        void trace_before(TccTraceRecord& r) const;
+        void trace_after(TccTraceRecord& r) const;
 
         void set_stationary();
         
@@ -118,6 +121,8 @@ class TorqueConverter {
         bool prefill_done = false;
         bool prefill_running = false;
         uint8_t prefill_cycles = 0;
+        bool trace_prefill_taken = false;
+        int trace_command_before_atf = 0;
 };
 
 #endif
