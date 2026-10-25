@@ -1,3 +1,5 @@
+#include "gliding_feedback.h"
+#include "city34_guard.h"
 #include "gearbox.h"
 #include "tcc_trace.h"
 #include "s_city_tcc_coast.h"
@@ -848,6 +850,8 @@ void Gearbox::controller_loop()
         }
         vTaskDelay(5);
     }
+    Gliding::Feedback glide_feedback;
+    City34Guard city34_guard;
     bool previous_speeds_valid = true;
     bool previous_engine_valid = true;
     bool previous_pedal_valid = true;
@@ -869,6 +873,8 @@ void Gearbox::controller_loop()
             TCUIO::update_io_layer();
             RuntimeMonitor::source_complete(RuntimeMonitor::Source::IoCompletion, RuntimeMonitor::now_us());
         }
+        const uint32_t glide_turbine_at=GET_CLOCK_TIME();
+        const uint16_t glide_raw_turbine=TCUIO::raw_turbine_rpm();
         if (CHECK_MODE_BIT_ENABLED(DEVICE_MODE_SLAVE)) {
             if (this->tcc) {
                 this->tcc->suspend(this->pressure_mgr);
@@ -1185,6 +1191,7 @@ void Gearbox::controller_loop()
             }
         }
         if (!forward_control_valid) {
+            city34_guard.reset();
             this->ask_downshift = false;
             this->ask_upshift = false;
             this->manual_shift = false;
@@ -1218,6 +1225,7 @@ void Gearbox::controller_loop()
                     this->restrict_target = next_gear(this->restrict_target);
                 }
 
+                if(shifting || actual_gear!=target_gear || gear_disagree_count!=0)city34_guard.reset();
                 // In gear, not shifting, and no ratio mismatch
                 if (!shifting && this->actual_gear == this->target_gear && gear_disagree_count == 0)
                 {
@@ -1232,7 +1240,16 @@ void Gearbox::controller_loop()
                         p->update(&this->sensor_data);
                         // Ask the current drive profile if it thinks, given the current
                         // data, if the car should up/downshift
-                        if (this->restrict_target > this->actual_gear && p->should_upshift(this->actual_gear, &this->sensor_data))
+                        bool automatic_up=p->should_upshift(this->actual_gear, &this->sensor_data);
+                        const bool city_profile=p->get_profile()==GearboxProfile::Standard || p->get_profile()==GearboxProfile::Agility;
+                        if(city_profile && this->actual_gear==GearboxGear::Third) {
+                            StoredMap* down=p->get_downshift_map();
+                            const uint16_t next_rpm=calc_input_rpm_from_req_gear(sensor_data.output_rpm,GearboxGear::Fourth,&gearboxConfig);
+                            const uint16_t down_rpm=down ? down->get_value(float(coast_pedal)/2.5f,4.0f) : UINT16_MAX;
+                            automatic_up=city34_guard.allow(forward_control_valid && coast_pedal<=250 && down!=nullptr,
+                                automatic_up,coast_pedal,sensor_data.kickdown_pressed,next_rpm,down_rpm,GET_CLOCK_TIME());
+                        } else city34_guard.reset();
+                        if (this->restrict_target > this->actual_gear && automatic_up)
                         {
                             this->ask_upshift = true; // Upshift takes priority
                             this->manual_shift = false;
@@ -1363,8 +1380,28 @@ void Gearbox::controller_loop()
                         fifth_ratio >= gearboxConfig.bounds[4].ratio_min_drift &&
                         fifth_ratio <= gearboxConfig.bounds[4].ratio_max_drift;
                     glide_context.speed_x100 = Gliding::speed_x100(gliding_can, VEHICLE_CONFIG.wheel_circumference);
-                    glide_context.engine_rpm = coast_engine_rpm;
-                    glide_context.input_rpm = sensor_data.input_rpm;
+                    const uint32_t glide_now=GET_CLOCK_TIME();
+                    glide_context.engine_age_ms=uint16_t(glide_now-gliding_can.received_at_ms[5]);
+                    glide_context.turbine_age_ms=uint16_t(glide_now-glide_turbine_at);
+                    const bool aligned=glide_feedback.update(
+                        gliding_can.rpm_valid && gliding_can.torque_valid && coast_raw_speeds_valid,
+                        gliding_can.engine_rpm,gliding_can.received_at_ms[5],
+                        glide_raw_turbine,glide_turbine_at,glide_now,
+                        glide_context.engine_rpm,glide_context.input_rpm);
+                    glide_context.feedback_valid &= aligned;
+                    glide_context.rpm_skew_ms=glide_feedback.skew();
+                    const uint32_t turbine_age=glide_now-glide_feedback.selected_at();
+                    glide_context.turbine_age_ms=turbine_age>UINT16_MAX?UINT16_MAX:uint16_t(turbine_age);
+                    const uint32_t torque_age=glide_now-gliding_can.received_at_ms[6];
+                    glide_context.torque_age_ms=torque_age>UINT16_MAX?UINT16_MAX:uint16_t(torque_age);
+                    // Revalidate the whole safety snapshot at actuation time, not only at its earlier read.
+                    for(unsigned source=0;source<7;++source) {
+                        if(glide_now-gliding_can.received_at_ms[source]>=Gliding::CAN_EXPIRY_MS) {
+                            glide_context.feedback_valid=false;
+                            glide_context.can.cruise=CruiseControlState::Unknown;
+                        }
+                    }
+                    glide_context.feedback_at_ms=gliding_can.received_at_ms[5];
                     glide_context.torque_nm = glide_torque.m_converted_static;
                     glide_context.atf_c = sensor_data.atf_temp;
                     this->tcc->update(this->actual_gear, this->target_gear, this->pressure_mgr,

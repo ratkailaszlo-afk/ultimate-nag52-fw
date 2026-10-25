@@ -290,6 +290,11 @@ uint16_t TCUIO::calc_turbine_rpm(const uint16_t n2, const uint16_t n3) {
     return MAX(0,((float)n2 * RATIO_2_1) + ((float)n3 - (RATIO_2_1*(float)n3)));
 }
 
+uint16_t TCUIO::raw_turbine_rpm() {
+    if(raw_sensors.rpm_n2==UINT16_MAX || raw_sensors.rpm_n3==UINT16_MAX) return UINT16_MAX;
+    return calc_turbine_rpm(raw_sensors.rpm_n2,raw_sensors.rpm_n3);
+}
+
 uint8_t TCUIO::parking_lock() { return get_onepoll_sensor_val(&onepoll_parking_lock, 0); }
 int16_t TCUIO::atf_temperature() { return smoothed_sensor_atf_temp.last_value/100;}
 bool TCUIO::atf_temperature_valid() { return atf_temp_valid.load(std::memory_order_relaxed); }

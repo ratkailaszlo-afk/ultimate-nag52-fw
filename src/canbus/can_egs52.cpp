@@ -419,13 +419,18 @@ GlidingCanInputs Egs52Can::get_gliding_inputs(uint32_t expire_time_ms) {
     BS_208_EGS52 bs208{};
     BS_200_EGS52 bs200{};
     EWM_230_EGS52 ewm{};
+    MS_308_EGS52 rpm{};MS_312_EGS52 torque{};
     portENTER_CRITICAL(&gliding_can_mux);
     const uint8_t invalid = gliding_invalid_mask;
+    for(unsigned i=0;i<7;++i)out.received_at_ms[i]=gliding_rx_at[i];
     const bool driver_seen = !(invalid & 1) && ecu_ms.get_MS_210(now, expire_time_ms, &ms210);
     const bool dynamics_seen = !(invalid & 2) && esp_ecu.get_BS_300(now, expire_time_ms, &bs300);
     const bool wheels_seen = !(invalid & 4) && esp_ecu.get_BS_208(now, expire_time_ms, &bs208);
     const bool brake_seen = !(invalid & 8) && esp_ecu.get_BS_200(now, expire_time_ms, &bs200);
     const bool selector_seen = !(invalid & 16) && ewm_ecu.get_EWM_230(now, expire_time_ms, &ewm);
+    out.rpm_valid=!(invalid&32) && ecu_ms.get_MS_308(now,expire_time_ms,&rpm) && rpm.NMOT!=UINT16_MAX;
+    out.torque_valid=!(invalid&64) && ecu_ms.get_MS_312(now,expire_time_ms,&torque) && torque.M_STA!=UINT16_MAX;
+    if(out.rpm_valid)out.engine_rpm=rpm.NMOT;
     portEXIT_CRITICAL(&gliding_can_mux);
     out.driver_valid = driver_seen && ms210.PW <= 250 && !ms210.PWG_ERR &&
         !ms210.NOTL && !ms210.CRASH_MS;
@@ -957,6 +962,8 @@ void Egs52Can::on_rx_frame(uint32_t id,  uint8_t dlc, uint64_t data, const uint3
     else if (id == BS_208_EGS52_CAN_ID) watched = 4;
     else if (id == BS_200_EGS52_CAN_ID) watched = 8;
     else if (id == EWM_230_EGS52_CAN_ID) watched = 16;
+    else if (id == MS_308_EGS52_CAN_ID) watched = 32;
+    else if (id == MS_312_EGS52_CAN_ID) watched = 64;
     portENTER_CRITICAL(&gliding_can_mux);
     if (watched && dlc != 8) {
         gliding_invalid_mask |= watched;
@@ -964,6 +971,7 @@ void Egs52Can::on_rx_frame(uint32_t id,  uint8_t dlc, uint64_t data, const uint3
         return;
     }
     gliding_invalid_mask &= uint8_t(~watched);
+    for(unsigned i=0;i<7;++i)if(watched==(1u<<i))gliding_rx_at[i]=timestamp;
     if(this->ecu_ms.import_frames(data, id, timestamp)) {
         //if (this->fake_rpm != 0 && id == MS_308_CAN_ID) {
         //    uint64_t d = (data & 0xff0000ffffffffff) | ((uint64_t)this->fake_rpm & 0xffff) << 40;

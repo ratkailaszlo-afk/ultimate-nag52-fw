@@ -110,7 +110,8 @@ class Egs52Can: public EgsBaseCan {
         void on_rx_frame(uint32_t id,  uint8_t dlc, uint64_t data, const uint32_t timestamp) override;
     private:
         portMUX_TYPE gliding_can_mux = portMUX_INITIALIZER_UNLOCKED;
-        uint8_t gliding_invalid_mask = 0x1F; // Explicit unseen/malformed watched frames.
+        uint32_t gliding_rx_at[7] = {};
+        uint8_t gliding_invalid_mask = 0x7F; // Explicit unseen/malformed watched frames.
         GearboxProfile curr_profile_bit = GearboxProfile::Underscore;
         GearboxMessage curr_message = GearboxMessage::None;
         // CAN Frames to Tx

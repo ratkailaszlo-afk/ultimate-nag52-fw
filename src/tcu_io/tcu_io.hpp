@@ -59,6 +59,7 @@ namespace TCUIO {
     void set_2_1_ratio(float ratio);
     void set_input_rpm_perform_sanity_check(bool conduct);
 
+    uint16_t raw_turbine_rpm();
     uint16_t calc_turbine_rpm(const uint16_t n2, const uint16_t n3);
 
     uint8_t parking_lock();

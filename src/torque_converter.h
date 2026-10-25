@@ -68,7 +68,15 @@ class TorqueConverter {
         void trace_after(TccTraceRecord& r) const;
 
         bool gliding_display_active() const { return glide.show_g(); }
-        Gliding::Status gliding_status(uint32_t now) const { return glide.status(now); }
+        Gliding::Status gliding_status(uint32_t now) const {
+            Gliding::Status s=glide.status(now);
+            s.city_phase=uint8_t(city_reapply.phase());s.city_outcome=uint8_t(city_reapply.outcome());
+            s.city_contact=uint8_t(city_reapply.contact());s.city_guarded=city_reapply.guarded();
+            const int32_t closure=city_reapply.closure_rate();
+            s.city_closure_rpm_per_s=closure>INT16_MAX?INT16_MAX:closure<INT16_MIN?INT16_MIN:int16_t(closure);
+            const uint32_t work=city_reapply.work_proxy_j();s.city_work_proxy_j=work>UINT16_MAX?UINT16_MAX:uint16_t(work);
+            return s;
+        }
         void set_stationary();
         
         void shift_start(bool upshift, bool release_shifting);
@@ -110,6 +118,7 @@ class TorqueConverter {
 
     private:
         Gliding::Controller glide;
+        Reapply::Control city_reapply;
         // bit0 Open, bit1 Slipping: selected CAN request before reaction flags.
         std::atomic<uint8_t> can_request_bits{0};
         // Multiplied by 100!

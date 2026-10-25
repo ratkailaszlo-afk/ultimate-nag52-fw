@@ -4,7 +4,7 @@
 #include "gliding_mode.h"
 
 namespace GlidingStatus {
-constexpr size_t WIRE_SIZE = 40;
+constexpr size_t WIRE_SIZE = 64;
 void publish(const Gliding::Status& status);
 bool read(uint8_t* output, size_t capacity, size_t* used);
 }

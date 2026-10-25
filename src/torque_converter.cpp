@@ -89,7 +89,8 @@ int16_t get_cell_value(int16_t* dest, GearboxGear gear, uint8_t load_idx) {
 
 
 void TorqueConverter::suspend(PressureManager* pm) {
-    this->glide.suspend();
+    this->glide.suspend(GET_CLOCK_TIME());
+    this->city_reapply.interrupt(GET_CLOCK_TIME());
     // The gearbox may force the electrical target off without calling update().
     // Drop the matching internal model so re-entry gets a fresh prefill decision.
     this->tcc_commanded_pressure = 0;
@@ -132,7 +133,17 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
         local_gliding.shifting = local_gliding.shifting || this->is_shifting;
     }
     this->glide.observe(gliding != nullptr ? &local_gliding : nullptr, GET_CLOCK_TIME());
-    const bool glide_managed = this->glide.managed();
+    const bool city_scope=gliding!=nullptr && profile!=nullptr &&
+        (profile->get_profile()==GearboxProfile::Standard || profile->get_profile()==GearboxProfile::Agility) &&
+        (curr_gear==GearboxGear::Third || curr_gear==GearboxGear::Fourth) &&
+        curr_gear==targ_gear && !is_shifting;
+    if(city_scope && was_shifting && gliding->atf_valid) city_reapply.start(GET_CLOCK_TIME(),uint16_t(tcc_commanded_pressure));
+    if(!city_scope) city_reapply.interrupt(GET_CLOCK_TIME());
+    const bool city_managed=city_scope && city_reapply.guarded();
+    // Persistent pressure ownership is independent from the temporary recovery
+    // policy. Normal adaptation and prefill eligibility resume after completion;
+    // any later burst/map target still passes through the retained output guard.
+    const bool glide_managed = this->glide.control_active() || (city_managed && city_reapply.active());
     int motor_torque = glide_managed && gliding != nullptr && gliding->feedback_valid
         ? gliding->torque_nm : sensors->converted_torque;
     this->last_control_torque = motor_torque;
@@ -422,7 +433,28 @@ void TorqueConverter::update(GearboxGear curr_gear, GearboxGear targ_gear, Press
         float mul = interpolate_float(sensors->atf_temp, &TCC_CURRENT_SETTINGS.tcc_temp_multiplier, InterpType::Linear);
         this->tcc_commanded_pressure = (float)this->tcc_commanded_pressure*mul;
     }
-    this->tcc_commanded_pressure = this->glide.limit(this->tcc_commanded_pressure, GET_CLOCK_TIME());
+    // A legacy prefill request is an actuator pulse, not the normal map target.
+    // Guarded recovery/fallback must never ramp toward that pulse as its ceiling.
+    if(this->trace_prefill_taken && (this->glide.pressure_guarded() || city_managed)) {
+        int normal_map_pressure=this->target_tcc_state==InternalTccState::Open ? 0 :
+            this->target_tcc_state==InternalTccState::Slipping ?
+            this->tcc_slip_map->get_value(load_as_percent,uint8_t(curr_gear)) :
+            this->tcc_lock_map->get_value(load_as_percent,uint8_t(curr_gear));
+        if(sensors->atf_temp<TCC_CURRENT_SETTINGS.tcc_temp_multiplier.raw_max) {
+            normal_map_pressure=float(normal_map_pressure)*interpolate_float(sensors->atf_temp,
+                &TCC_CURRENT_SETTINGS.tcc_temp_multiplier,InterpType::Linear);
+        }
+        this->tcc_commanded_pressure=MAX(0,MIN(normal_map_pressure,int(UINT16_MAX)));
+    }
+    this->tcc_commanded_pressure = this->glide.limit(this->tcc_commanded_pressure, GET_CLOCK_TIME(),
+        Reapply::Mode(uint8_t(this->target_tcc_state)),this->slip_target);
+    if(city_managed && !this->glide.pressure_guarded()) {
+        Reapply::Sample sample;sample.valid=gliding->feedback_valid;
+        sample.slip=int32_t(gliding->engine_rpm)-gliding->input_rpm;
+        sample.torque=gliding->torque_nm;sample.timestamp=gliding->feedback_at_ms;
+        this->tcc_commanded_pressure=city_reapply.update(this->tcc_commanded_pressure,
+            Reapply::Mode(uint8_t(this->target_tcc_state)),this->slip_target,sample,GET_CLOCK_TIME());
+    }
     // Pressure achieved in the internal filtered model (not measured pressure).
     if (abs(this->tcc_commanded_pressure-this->tcc_actual_pressure/100) < 1) {
         this->current_tcc_state = this->target_tcc_state;

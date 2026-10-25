@@ -5,6 +5,9 @@
 enum class CruiseControlState : uint8_t { Unknown = 0, Inactive = 1, Active = 2 };
 
 struct GlidingCanInputs {
+    uint32_t received_at_ms[7] = {};
+    bool rpm_valid=false, torque_valid=false;
+    uint16_t engine_rpm=UINT16_MAX;
     bool driver_valid = false;
     uint8_t pedal = UINT8_MAX;
     CruiseControlState cruise = CruiseControlState::Unknown;
